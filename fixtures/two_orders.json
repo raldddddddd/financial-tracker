@@ -1,0 +1,15 @@
+{
+  "combined_payment": "2097.00",
+  "orders": [
+    {
+      "order_id": "DEMO-ORDER-0001", "status": "paid", "paid_total": "1025.00",
+      "shipping_fee": "", "discount_total": "", "refund_amount": "",
+      "items": [{"name": "Whiskas Pouch Adult Cat Wet Food 80g (56-Pack)", "quantity": 1, "unit_price": "1025.00", "line_total": "1025.00", "category": "Pet Supplies"}]
+    },
+    {
+      "order_id": "DEMO-ORDER-0002", "status": "paid", "paid_total": "1072.00",
+      "shipping_fee": "", "discount_total": "", "refund_amount": "",
+      "items": [{"name": "Fancy Feast Assorted Adult Wet Cat Food (30+6)", "quantity": 1, "unit_price": "1072.00", "line_total": "1072.00", "category": "Pet Supplies"}]
+    }
+  ]
+}

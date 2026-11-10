@@ -1,0 +1,1 @@
+"""Personal Shopee expense tracker."""
