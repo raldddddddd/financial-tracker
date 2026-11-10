@@ -1,1 +1,1 @@
-"""Personal Shopee expense tracker."""
+"""Personal Shopee and TikTok Shop expense tracker."""
