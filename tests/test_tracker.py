@@ -111,9 +111,9 @@ class TrackerTests(unittest.TestCase):
         self.assertNotIn("PAGED-19", second)
         self.assertIn('href="/?page=1#orders"', second)
         self.assertIn("Showing 21–21 of 21", second)
-        self.assertIn("₱2,097.00", second)
+        self.assertIn('<div class="total">₱21,525.00</div>', second)
         self.assertEqual(page(data, 999), second)
-        self.assertIn('href="/?shop=shopee&page=2#orders"', page(data, 1, "shopee"))
+        self.assertIn('href="/?shop=shopee&amp;page=2#orders"', page(data, 1, "shopee"))
 
     def test_refund_cancellation_and_older_email(self):
         ingest(self.db, "email-1", 1000, "Payment confirmed", self.fixture)
@@ -121,9 +121,10 @@ class TrackerTests(unittest.TestCase):
         ingest(self.db, "email-2", 2000, "Refund", refund)
         cancel = {"orders": [{"order_id": "DEMO-ORDER-0002", "status": "cancelled", "paid_total": "", "shipping_fee": "", "protection_subtotal": "", "discount_total": "", "coins_used": "", "refund_amount": "", "items": []}]}
         ingest(self.db, "email-3", 3000, "Cancelled", cancel)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 90000)
+        self.assertEqual(dashboard_data(self.db)["total_cents"], 197200)
         ingest(self.db, "older", 500, "Payment confirmed", self.fixture)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 90000)
+        self.assertEqual(dashboard_data(self.db)["total_cents"], 197200)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='unknown_refund'").fetchone()[0], 1)
 
     def test_shopee_refund_waits_for_review_result(self):
         paid = json.loads(json.dumps(self.fixture["orders"][0]))
@@ -140,15 +141,16 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(ingest(self.db, "result", 3000, result_subject, event,
                                 "Request DEMO-ORDER-0001: Your refund was approved. Refund amount: ₱125.00"),
                          "processed 1 refund request")
-        saved = self.db.execute("SELECT request_id,refund_cents,order_id FROM refund_requests").fetchone()
-        self.assertEqual(tuple(saved), ("DEMO-ORDER-0001", 12500, None))
+        saved = self.db.execute("SELECT reference_type,reference_id,amount_cents FROM refund_events").fetchone()
+        self.assertEqual(tuple(saved), ("request", "DEMO-ORDER-0001", 12500))
         self.assertEqual(self.db.execute("SELECT status,refund_cents FROM orders WHERE order_id='DEMO-ORDER-0001'").fetchone()[:],
                          ("paid", 0))
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='orphan_event'").fetchone()[0], 0)
         dashboard = page(dashboard_data(self.db), shop="shopee")
-        self.assertIn("Approved refunds awaiting order link", dashboard)
+        self.assertIn("Request DEMO-ORDER-0001", dashboard)
         self.assertIn("₱125.00", dashboard)
-        self.assertIn("Approved refund needs order link", dashboard)
+        self.assertNotIn("Approved refund needs order link", dashboard)
+        self.assertEqual(dashboard_data(self.db)["total_cents"], 90000)
 
     def test_shopee_review_result_without_amount_needs_review(self):
         event = {"orders": [{"order_id": "DEMO-ORDER-0001", "status": "refunded",
@@ -166,7 +168,7 @@ class TrackerTests(unittest.TestCase):
             ingest(self.db, "result", 3000,
                    "Review result for request DEMO-ORDER-0001 - Shopee", event,
                    "Request DEMO-ORDER-0001 was denied. The requested amount was ₱258.")
-        self.assertEqual(self.db.execute("SELECT count(*) FROM refund_requests").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM refund_events").fetchone()[0], 0)
 
     def test_shopee_approved_refund_reads_result_amount(self):
         subject = "Review result for request DEMO-ORDER-0001 - Shopee"
@@ -191,8 +193,75 @@ class TrackerTests(unittest.TestCase):
         self.db.close()
         self.db = connect(Path(self.temp.name) / "data" / "test.sqlite3")
         self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
-        self.assertEqual(self.db.execute("SELECT refund_cents FROM refund_requests").fetchone()[0], 25800)
+        self.assertEqual(self.db.execute("SELECT amount_cents FROM refund_events").fetchone()[0], 25800)
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues").fetchone()[0], 0)
+
+    def test_legacy_refunds_migrate_once_and_leave_orders_paid(self):
+        paid = self.fixture["orders"][0]
+        ingest(self.db, "paid", 1000, "Payment confirmed", {"orders": [paid]})
+        with self.db:
+            self.db.execute("UPDATE orders SET refund_cents=47200,updated_ms=3000,source_gmail_id='old-refund' WHERE order_id=?",
+                            (paid["order_id"],))
+            self.db.execute("INSERT INTO messages VALUES (?,?,?,?,?)", ("old-refund", 3000, "Refund", "processed", None))
+            self.db.execute("INSERT INTO refund_requests VALUES (?,?,?,?,?)", ("REQUEST-1", 4000, 25800, "request-mail", None))
+        self.db.close()
+        path = Path(self.temp.name) / "data" / "test.sqlite3"
+        self.db = connect(path)
+        self.assertEqual(self.db.execute("SELECT refund_cents FROM orders").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT count(*),sum(amount_cents) FROM refund_events").fetchone()[:], (2, 73000))
+        self.assertEqual(dashboard_data(self.db)["total_cents"], 102500 - 73000)
+        self.db.close()
+        self.db = connect(path)
+        self.assertEqual(self.db.execute("SELECT count(*),sum(amount_cents) FROM refund_events").fetchone()[:], (2, 73000))
+
+    def test_refund_before_paid_order_is_counted_once(self):
+        event = {"orders": [{"order_id": "DEMO-ORDER-0001", "status": "partial_refund",
+                             "paid_total": "", "refund_amount": "25.00", "items": []}]}
+        ingest(self.db, "refund", 2000, "Refund", event)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
+        self.assertEqual(dashboard_data(self.db)["total_cents"], -2500)
+        self.assertEqual(ingest(self.db, "refund", 2000, "Refund", event), "already processed")
+        ingest(self.db, "paid", 1000, "Payment confirmed", {"orders": [self.fixture["orders"][0]]})
+        self.assertEqual(dashboard_data(self.db)["total_cents"], 100000)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM refund_events").fetchone()[0], 1)
+
+    def test_distinct_refunds_for_one_order_add_without_changing_categories(self):
+        ingest(self.db, "paid", 1000, "Payment confirmed", {"orders": [self.fixture["orders"][0]]})
+        for gmail_id, amount, timestamp in (("refund-one", "25.00", 2000), ("refund-two", "10.00", 3000)):
+            event = {"orders": [{"order_id": "DEMO-ORDER-0001", "status": "partial_refund",
+                                 "paid_total": "", "refund_amount": amount, "items": []}]}
+            ingest(self.db, gmail_id, timestamp, "Refund", event)
+        data = dashboard_data(self.db)
+        self.assertEqual(data["paid_total_cents"], 102500)
+        self.assertEqual(data["refund_total_cents"], 3500)
+        self.assertEqual(data["total_cents"], 99000)
+        self.assertEqual(data["categories"], {"Pet Supplies": 102500})
+        self.assertEqual(self.db.execute("SELECT count(*) FROM refund_events").fetchone()[0], 2)
+        self.assertEqual(self.db.execute("SELECT refund_cents FROM orders").fetchone()[0], 0)
+
+    def test_category_drilldown_shows_only_matching_items_and_allocated_paid(self):
+        paid = {"orders": [{"order_id": "MIXED-ORDER-0001", "status": "paid", "paid_total": "100.01",
+                            "shipping_fee": "", "discount_total": "199.99", "refund_amount": "", "items": [
+                                {"name": "Cat food", "quantity": 1, "unit_price": "200.00", "line_total": "200.00", "category": "Pet Supplies"},
+                                {"name": "Rice", "quantity": 1, "unit_price": "100.00", "line_total": "100.00", "category": "Groceries"}]}]}
+        ingest(self.db, "paid", 1000, "Payment confirmed", paid)
+        result = {"orders": [{"order_id": "REQUEST-1", "status": "partial_refund", "refund_amount": "10.00"}]}
+        ingest(self.db, "result", 2000, "Review result for request REQUEST-1", result,
+               "Request REQUEST-1 refund was approved for ₱10.00")
+        data = dashboard_data(self.db)
+        self.assertEqual(data["total_cents"], 9001)
+        self.assertEqual(data["categories"], {"Pet Supplies": 6667, "Groceries": 3334})
+        html = page(data, category="Pet Supplies")
+        self.assertIn('<div class="total">₱90.01</div>', html)
+        self.assertIn('Category paid: ₱66.67', html)
+        self.assertIn('<td class="number strong">₱66.67</td>', html)
+        self.assertIn('Cat food ×1', html)
+        self.assertNotIn('Rice ×1', html)
+        self.assertIn('Full order paid ₱100.01', html)
+        self.assertIn('aria-label="Purchase spending by category"', html)
+        self.assertIn('href="/?category=Pet+Supplies#orders"', html)
+        self.assertIn('All categories', html)
+        self.assertIn('<h2>Refunds</h2><strong>₱10.00</strong>', html)
 
     def test_old_pending_shopee_orphan_is_removed_on_open(self):
         subject = "Return/Refund under review: #DEMO-ORDER-0001"
@@ -224,19 +293,18 @@ class TrackerTests(unittest.TestCase):
         ingest(self.db, "tiktok-refund", 2000, "Refund", tiktok_refund, platform="TikTok Shop")
 
         shopee_view = page(dashboard_data(self.db), shop="shopee")
-        self.assertIn('<th class="number">Total</th>', shopee_view)
-        self.assertNotIn('<th class="number">Paid</th>', shopee_view)
+        self.assertIn('<th class="number">Paid</th>', shopee_view)
         self.assertNotIn('<th class="number">Refund</th>', shopee_view)
         self.assertNotIn('<th class="number">Net</th>', shopee_view)
-        self.assertIn('<td class="number strong">₱450.00</td>', shopee_view)
+        self.assertIn('<td class="number strong">₱500.00</td>', shopee_view)
         self.assertIn('<div class="total">₱450.00</div>', shopee_view)
-        self.assertIn('<span>Pet Supplies</span>', shopee_view)
+        self.assertIn('Pet Supplies</span><strong>₱500.00</strong>', shopee_view)
         self.assertIn('<section class="card" id="refunds">', shopee_view)
         self.assertIn('<h2>Refunds</h2><strong>₱50.00</strong>', shopee_view)
         self.assertNotIn('₱25.00', shopee_view)
 
         tiktok_view = page(dashboard_data(self.db), shop="tiktok")
-        self.assertIn('<td class="number strong">₱175.00</td>', tiktok_view)
+        self.assertIn('<td class="number strong">₱200.00</td>', tiktok_view)
         self.assertIn('<h2>Refunds</h2><strong>₱25.00</strong>', tiktok_view)
         self.assertNotIn('₱50.00', tiktok_view)
         all_view = page(dashboard_data(self.db))
@@ -258,11 +326,12 @@ Shipping fee refund
 Total (1 item)
 ₱472.00"""
         ingest(self.db, "tiktok-refund", 2000, "Refund", event, source, platform="TikTok Shop")
-        saved = self.db.execute("SELECT refund_cents FROM orders WHERE order_id='tiktok:DEMO-ORDER-0001'").fetchone()
+        saved = self.db.execute("SELECT amount_cents FROM refund_events WHERE platform='TikTok Shop'").fetchone()
         self.assertEqual(saved[0], 47200)
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='refund_exceeds_paid'").fetchone()[0], 0)
         html = page(dashboard_data(self.db), shop="tiktok")
-        self.assertIn('<td class="number strong">₱0.00</td>', html)
+        self.assertIn('<td class="number strong">₱472.00</td>', html)
+        self.assertIn('<div class="total">₱0.00</div>', html)
         self.assertIn('<h2>Refunds</h2><strong>₱472.00</strong>', html)
 
     def test_tiktok_order_with_same_id_is_separate(self):
@@ -282,13 +351,13 @@ Total (1 item)
         tiktok_view = page(data, shop="tiktok")
         self.assertIn('<h1>TikTok Shop spending</h1>', tiktok_view)
         self.assertIn('<div class="total">₱200.00</div>', tiktok_view)
-        self.assertIn('<span>Electronics</span>', tiktok_view)
+        self.assertIn('<span class="category-name">Electronics</span>', tiktok_view)
         self.assertNotIn('<span>Pet Supplies</span>', tiktok_view)
         self.assertNotIn('shop-tag shop-shopee', tiktok_view)
         self.assertNotIn('Shopee coins ₱25.00', tiktok_view)
         shopee_view = page(data, shop="shopee")
         self.assertIn('<div class="total">₱1,000.00</div>', shopee_view)
-        self.assertIn('<span>Pet Supplies</span>', shopee_view)
+        self.assertIn('<span class="category-name">Pet Supplies</span>', shopee_view)
         self.assertNotIn('<span>Electronics</span>', shopee_view)
         self.assertNotIn('shop-tag shop-tiktok', shopee_view)
         self.assertIn('Shopee coins ₱25.00', shopee_view)
