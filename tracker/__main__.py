@@ -8,19 +8,55 @@ import secrets
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .charts import category_pie, line_chart
-from .core import CATEGORIES, MANILA_TZ, ROOT, add_manual_purchase, add_manual_refund, archive_record, backup_database, bind_account, connect, correct_order, correct_refund, dashboard_data, dismiss_review, export_csv, gmail_service, ignore_email, load_env, php, purge_legacy_demo, recheck_refunds, resolve_conflict, resolve_refund_duplicate, run_sync, seed_demo, spending_summary, undo_change
-from .insights import available_years, filter_period, filter_refunds, resolve_period, trend_series
+from .core import (CATEGORIES, MANILA_TZ, ROOT, add_manual_purchase, add_manual_refund,
+                   archive_record, backup_database, bind_account, connect, correct_order,
+                   correct_refund, dashboard_data, dismiss_review, export_csv, gmail_service,
+                   ignore_email, load_env, php, purge_legacy_demo, recheck_refunds,
+                   resolve_conflict, resolve_refund_duplicate, run_sync, seed_demo,
+                   set_monthly_budget, spending_summary, undo_change)
+from .insights import (available_years, filter_period, filter_refunds, month_net,
+                       resolve_period, top_products, trend_series)
 
 
 ORDERS_PER_PAGE = 20
 DASHBOARD_CSS = Path(__file__).with_name("dashboard.css").read_text(encoding="utf-8")
 DASHBOARD_JS = Path(__file__).with_name("dashboard.js").read_text(encoding="utf-8")
+
+
+# shortcut: one local server owns sync; use a shared lock before multiple server processes.
+class SyncManager:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.process = None
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+
+    def start(self) -> None:
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                raise ValueError("Sync is already running")
+            try:
+                self.process = subprocess.Popen(
+                    [sys.executable, "-m", "tracker", "--database", str(self.db_path), "sync"],
+                    cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                raise ValueError("Could not start sync") from exc
+
+    def repeat(self, minutes: int) -> None:
+        while not self.stopped.is_set():
+            try:
+                self.start()
+            except ValueError as exc:
+                if str(exc) != "Sync is already running":
+                    print(f"Automatic sync: {exc}", file=sys.stderr)
+            self.stopped.wait(minutes * 60)
 
 
 def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", start: str = "", end: str = "",
@@ -57,6 +93,12 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
     paid_total, categories = spending_summary(orders)
     refund_total = sum(refund["amount_cents"] for refund in refunds)
     total = paid_total - refund_total
+    discounts_total = sum(order["discount_cents"] or 0 for order in orders if order["paid_cents"])
+    products = top_products(orders)
+    this_month = datetime.now(MANILA_TZ).date().replace(day=1)
+    current_spend = month_net(data["orders"], data["refunds"], this_month)
+    previous_spend = month_net(data["orders"], data["refunds"], this_month - timedelta(days=1))
+    budget = data.get("monthly_budget_cents")
     all_orders_by_id = {order["order_id"]: order for order in data["orders"]}
     net_categories = dict(categories)
     for refund in refunds:
@@ -327,6 +369,35 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
     sync_controls = (f'<form method="post" action="/action" class="sync-form">{csrf_field}'
                      '<input type="hidden" name="op" value="sync"><button type="submit">Sync now</button></form>'
                      '<a href="/">Refresh status</a>') if can_sync else ""
+    review_link = f'<a href="#review">{review_count} to review</a>' if review_count else ""
+    coverage = ('<div class="coverage-note">Email sources: Shopee and TikTok Shop. Check cash-on-delivery orders and missing receipts.'
+                f'{review_link}</div>')
+    product_rows = "".join(
+        f'<li><div><strong>{esc(name)}</strong><small>{esc(category)} · {quantity} item{"s" if quantity != 1 else ""}</small></div><span>{php(amount)}</span></li>'
+        for name, category, amount, quantity in products)
+    product_card = (f'<section class="card product-card" id="products"><div class="section-heading"><h2>What you bought most</h2><span class="section-meta">{esc(period.label)}</span></div>'
+                    f'<p class="insight-note">Paid amounts are split across priced items in each order. Unitemized orders are excluded.</p>'
+                    f'<ol class="product-list">{product_rows}</ol></section>' if product_rows else
+                    '<section class="card product-card" id="products"><div class="section-heading"><h2>What you bought most</h2></div>'
+                    '<p class="empty-state">Itemized paid purchases will appear here after a sync or manual entry.</p></section>')
+    if budget:
+        used_percent = min(100, max(0, round(current_spend / budget * 100)))
+        budget_status = (f'<div class="budget-progress{" over" if current_spend > budget else ""}" role="progressbar" aria-label="Monthly budget used" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{used_percent}"><span style="width:{used_percent}%"></span></div>'
+                         f'<p>{php(abs(budget - current_spend))} {"over budget" if current_spend > budget else "remaining"}</p>')
+    else:
+        budget_status = ''
+    budget_value = f'{budget / 100:.2f}' if budget else ''
+    budget_form = (f'<form method="post" action="/action" class="budget-form">{csrf_field}<input type="hidden" name="op" value="budget">'
+                   f'<label for="monthly-budget">Monthly limit (₱)</label><input id="monthly-budget" name="amount" type="number" min="0.01" step="0.01" placeholder="No limit set" value="{budget_value}">'
+                   f'<button type="submit">Save</button></form><small>Clear the field and save to remove the limit.</small>') if csrf_token else ""
+    change = current_spend - previous_spend
+    compare = (f'{php(abs(change))} more than last month' if change > 0 else
+               f'{php(abs(change))} less than last month' if change < 0 else
+               'The same as last month')
+    comparison = f'<p class="month-compare">{compare}.</p>' if previous_spend else ''
+    month_card = (f'<section class="card month-card" id="budget"><div class="section-heading"><h2>Monthly budget</h2><span class="section-meta">All shops · {this_month:%B %Y}</span></div>'
+                  f'<div class="month-summary"><div><small>Net spent</small><strong>{php(current_spend)}</strong></div><div><small>Monthly limit</small><strong>{php(budget) if budget else "Not set"}</strong></div></div>{budget_status}'
+                  f'{comparison}{budget_form}</section>')
     notice_html = f'<p class="filter-error" role="status">{esc(notice)}</p>' if notice else ""
     order_choices = "".join(f'<option value="{esc(order["order_id"])}">{esc(order.get("merchant") or order["platform"])}</option>'
                             for order in data["orders"])
@@ -344,9 +415,9 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
                 f'<label>Category<select name="item_category_{position}">{category_options(selected)}</select></label></div>')
     item_positions = sorted({int(key.removeprefix("item_name_")) for key in purchase_values if key.startswith("item_name_") and key.removeprefix("item_name_").isdigit()})
     item_count = max(1, max(item_positions, default=0) + 1)
-    add_section = (f'<section class="card add-card" id="add"><h2>Add a record</h2>'
+    add_section = (f'<details class="add-card" id="add"{" open" if purchase_values or manual_refund_values else ""}><summary>Add manually</summary><div class="manual-content"><p class="form-note">For purchases paid online only; exclude cash and cash on delivery.</p>'
                    f'<div class="add-forms"><form method="post" action="/action" id="purchase-form">{csrf_field}'
-                   '<input type="hidden" name="op" value="purchase"><h3>Other shop purchase</h3>'
+                   '<input type="hidden" name="op" value="purchase"><h3>Purchase</h3>'
                    f'<label>Merchant<input name="merchant" maxlength="120" value="{esc(purchase_values.get("merchant", ""))}" required></label>'
                    f'<label>Date<input name="date" type="date" value="{esc(purchase_values.get("date", datetime.now(MANILA_TZ).date().isoformat()))}" required></label>'
                    f'<label>Paid (₱)<input name="amount" type="number" min="0.01" step="0.01" value="{esc(purchase_values.get("amount", ""))}" required></label>'
@@ -354,13 +425,13 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
                    '<button type="button" data-add-item>Add another item</button>'
                    '<button type="submit">Add purchase</button></form>'
                    f'<form method="post" action="/action">{csrf_field}'
-                   '<input type="hidden" name="op" value="add_refund"><h3>Manual refund</h3>'
+                   '<input type="hidden" name="op" value="add_refund"><h3>Refund</h3>'
                    f'<label>Order ID<input name="order_id" list="tracked-orders" value="{esc(manual_refund_values.get("order_id", ""))}" data-refund-order required></label>'
                    f'<label>Date<input name="date" type="date" value="{esc(manual_refund_values.get("date", datetime.now(MANILA_TZ).date().isoformat()))}" required></label>'
                    f'<label>Refund (₱)<input name="amount" type="number" min="0.01" step="0.01" value="{esc(manual_refund_values.get("amount", ""))}" required></label>'
                    f'<div class="refund-item-fields" data-refund-items data-existing="{esc(json.dumps({key.removeprefix("refund_item_"): value for key, value in manual_refund_values.items() if key.startswith("refund_item_")}))}"></div>'
                    '<button type="submit">Add refund</button></form></div>'
-                   f'<datalist id="tracked-orders">{order_choices}</datalist></section>') if csrf_token else ""
+                   f'<datalist id="tracked-orders">{order_choices}</datalist></div></details>') if csrf_token else ""
     history_rows = "".join(f'<li>{esc(change["kind"].replace(":", " "))} · {esc(change["target_key"])} <form method="post" action="/action" class="inline-action">{csrf_field}<input type="hidden" name="op" value="undo"><input type="hidden" name="change_id" value="{change["id"]}"><button type="submit">Undo</button></form></li>' for change in data.get("changes", []))
     archived_rows = "".join(f'<li>{esc(row.get("merchant") or row.get("reference_id") or row.get("order_id"))}<form method="post" action="/action" class="inline-action">{csrf_field}<input type="hidden" name="op" value="restore"><input type="hidden" name="kind" value="{kind}"><input type="hidden" name="key" value="{esc(row.get("order_id") or row.get("event_key"))}"><button type="submit">Restore</button></form></li>' for kind, rows in (("order", data.get("archived_orders", [])), ("refund", data.get("archived_refunds", []))) for row in rows)
     history = f'<section class="card history-card" id="history"><h2>Corrections and archived records</h2><ul>{history_rows}{archived_rows or ""}</ul></section>' if csrf_token and (history_rows or archived_rows) else ""
@@ -368,22 +439,24 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
 <title>{title}</title><style>{DASHBOARD_CSS}</style></head><body><a class="skip-link" href="#main">Skip to content</a><div class="app-shell">
-<aside class="sidebar" aria-label="Dashboard navigation"><div class="brand"><span class="brand-mark" aria-hidden="true">S</span><span>Spendwise</span></div><nav class="side-nav" aria-label="Sections"><a class="current" href="#overview">Overview</a><a href="#orders">Orders</a><a href="#refunds">Refunds</a>{review_nav}{'<a href="#add">Add record</a>' if csrf_token else ''}</nav><div class="sidebar-note"><span class="status-dot"></span>Local dashboard</div></aside>
-<main id="main"><header class="page-header"><h1>{title}</h1></header><div class="sync-bar">{sync_status}<span>Last completed scan: {data_through}</span>{sync_controls}</div>{notice_html}
+<aside class="sidebar" aria-label="Dashboard navigation"><div class="brand"><span class="brand-mark" aria-hidden="true">S</span><span>Spendwise</span></div><nav class="side-nav" aria-label="Sections"><a class="current" href="#overview">Overview</a><a href="#products">Products</a><a href="#budget">Budget</a><a href="#orders">Purchases</a><a href="#refunds">Refunds</a>{review_nav}</nav></aside>
+<main id="main"><header class="page-header"><h1>{title}</h1></header><div class="sync-bar">{sync_status}<span>Last completed scan: {data_through}</span>{sync_controls}</div>{notice_html}{coverage}
 <nav class="shop-filter" id="shop-filter" aria-label="Filter dashboard by shop"><span class="shop-filter-label">SHOP</span><div class="shop-tabs">{shop_tabs}</div></nav>
 {filter_controls}{review}<div class="grid" id="overview"><section class="card hero-card"><div class="hero-top"><div class="eyebrow">Net spending</div></div><div class="total">{php(total)}</div><p class="hero-caption">{esc(period.label)}</p><div class="hero-rule"></div><div class="hero-bottom"><span>ORDERS TRACKED</span><strong>{order_count}</strong></div></section><section class="card category-card"><div class="section-heading"><h2>Purchase spending by category</h2><div class="category-heading-actions"><span class="section-meta">{len(categories)} categories</span>{category_heading_clear}</div></div>{category_content}{net_category_content}</section></div>
-<div class="metric-strip"><div class="metric-card"><span>Purchases paid</span><strong>{php(paid_total)}</strong></div><div class="metric-card"><span>Refunds recorded</span><strong>{php(refund_total)}</strong></div></div>
+<div class="metric-strip"><div class="metric-card"><span>Purchases paid</span><strong>{php(paid_total)}</strong></div><div class="metric-card"><span>Refunds recorded</span><strong>{php(refund_total)}</strong></div><div class="metric-card"><span>Recorded discounts</span><strong>{php(discounts_total)}</strong><small>From available receipts</small></div></div>
+{product_card}
+{month_card}
 <div class="{insights_class}">{trend_card}{shop_card}</div>
-<section class="card orders-card" id="orders"><div class="section-heading"><div><h2>{esc(category) + " purchases" if category else "Orders"}</h2>{f'<p class="insight-note">Category paid: {php(category_total)} · Matching orders: {detail_count}</p>' if category else ''}</div><span class="section-meta">{detail_count} {"matching" if search else "total"}</span></div>{category_clear}{search_form}<div class="tablewrap"><table><thead><tr><th>Date</th><th>Order & items</th><th>Status</th><th class="number">{"Category paid" if category else "Paid"}</th></tr></thead><tbody>{order_rows}</tbody></table></div>{pagination}</section>
+<section class="card orders-card" id="orders"><div class="section-heading"><div><h2>{esc(category) + " purchases" if category else "Purchases"}</h2>{f'<p class="insight-note">Category paid: {php(category_total)} · Matching orders: {detail_count}</p>' if category else ''}</div><span class="section-meta">{detail_count} {"matching" if search else "total"}</span></div>{category_clear}{search_form}<p class="table-hint">Scroll table horizontally for status and amount.</p><div class="tablewrap" tabindex="0" role="region" aria-label="Purchases table"><table><thead><tr><th>Date</th><th>Order & items</th><th>Status</th><th class="number">{"Category paid" if category else "Paid"}</th></tr></thead><tbody>{order_rows}</tbody></table></div>{pagination}</section>
 <section class="card" id="refunds"><div class="refund-head"><h2>Refunds</h2><strong>{php(refund_total)}</strong></div><ul class="refund-list">{refund_rows}</ul></section>
 {add_section}{history}
 </main></div><script src="/dashboard.js" defer></script></body></html>'''
 
 
-def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
+def serve(db, port: int, db_path: Path | None = None, demo: bool = False, auto_sync_minutes: int = 0):
     db_path = db_path.resolve() if db_path is not None else None
     csrf_token = secrets.token_urlsafe(32)
-    sync_process = None
+    sync_manager = SyncManager(db_path) if db_path is not None and not demo else None
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status: int, body: bytes, content_type: str):
             self.send_response(status)
@@ -453,7 +526,6 @@ def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
                 self.database_unavailable()
 
         def post(self):
-            nonlocal sync_process
             if self.path != "/action" or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
                 self.send_error(404)
                 return
@@ -473,16 +545,9 @@ def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
             op = fields.get("op")
             try:
                 if op == "sync":
-                    if db_path is None or demo:
+                    if sync_manager is None:
                         raise ValueError("Sync is unavailable for this dashboard")
-                    if sync_process and sync_process.poll() is None:
-                        raise ValueError("Sync is already running")
-                    try:
-                        sync_process = subprocess.Popen(
-                            [sys.executable, "-m", "tracker", "--database", str(db_path), "sync"],
-                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    except OSError as exc:
-                        raise ValueError("Could not start sync") from exc
+                    sync_manager.start()
                 elif op == "purchase":
                     positions = sorted({int(key.removeprefix("item_name_")) for key in fields
                                         if key.startswith("item_name_") and key.removeprefix("item_name_").isdigit()})
@@ -492,6 +557,8 @@ def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
                               "category": fields.get(f"item_category_{position}", "Other")} for position in positions]
                     add_manual_purchase(db, fields.get("merchant", ""), fields.get("date", ""),
                                         fields.get("amount", ""), items=items)
+                elif op == "budget":
+                    set_monthly_budget(db, fields.get("amount", ""))
                 elif op == "add_refund":
                     item_amounts = {int(key.removeprefix("refund_item_")): value for key, value in fields.items()
                                     if key.startswith("refund_item_") and key.removeprefix("refund_item_").isdigit() and value.strip()}
@@ -522,13 +589,23 @@ def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
                                        can_sync=db_path is not None and not demo).encode(), "text/html; charset=utf-8")
                 return
             self.send_response(303)
-            self.send_header("Location", "/?sync=started#overview" if op == "sync" else "/#" + ("add" if op in ("purchase", "add_refund") else "refunds" if op == "refund" else "review" if op in ("dismiss", "ignore_email", "resolve_duplicate", "resolve_conflict") else "history" if op in ("undo", "restore") else "orders"))
+            fragment = ("budget" if op == "budget" else "overview" if op == "purchase" else
+                        "refunds" if op in ("add_refund", "refund") else
+                        "review" if op in ("dismiss", "ignore_email", "resolve_duplicate", "resolve_conflict") else
+                        "history" if op in ("undo", "restore") else "orders")
+            self.send_header("Location", "/?sync=started#overview" if op == "sync" else f"/#{fragment}")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
     with HTTPServer(("127.0.0.1", port), Handler) as server:
         print(f"Dashboard: http://127.0.0.1:{port}")
-        server.serve_forever()
+        if sync_manager and auto_sync_minutes > 0:
+            threading.Thread(target=sync_manager.repeat, args=(auto_sync_minutes,), daemon=True).start()
+        try:
+            server.serve_forever()
+        finally:
+            if sync_manager:
+                sync_manager.stopped.set()
 
 
 def main():
@@ -550,6 +627,7 @@ def main():
     server = commands.add_parser("serve", help="Show the local dashboard")
     server.add_argument("--port", type=int, default=8765)
     server.add_argument("--demo", action="store_true", help="Serve the separate demo ledger")
+    server.add_argument("--sync-minutes", type=int, default=30, help="Sync automatically every N minutes (0 disables; demo never syncs)")
     args = parser.parse_args()
     if args.command == "auth":
         gmail_service()
@@ -579,7 +657,9 @@ def main():
     elif args.command == "backup":
         print(f"Backup: {backup_database(db, args.output)}")
     elif args.command == "serve":
-        serve(db, args.port, args.database, args.demo)
+        if args.sync_minutes < 0:
+            parser.error("--sync-minutes must be zero or greater")
+        serve(db, args.port, args.database, args.demo, args.sync_minutes)
 
 
 if __name__ == "__main__":

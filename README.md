@@ -14,7 +14,7 @@ python3 -m tracker serve --demo
 
 Open `http://127.0.0.1:8765`. The dashboard binds only to your computer. The sample lives in `data/demo.sqlite3`; the real ledger is `data/expenses.sqlite3`. Shop tabs and date filters apply to purchases and refunds together. Net spending is paid purchases minus counted refunds. The category pie shows gross paid purchases. **Net by category** deducts refunds only where returned item evidence supports a category; the rest appear as **Unallocated refunds**. Search narrows the Orders table without changing dashboard totals. Dates use Asia/Manila time.
 
-The dashboard shows the last sync attempt, the last successful scan, and failed email count. **Sync now** starts a background sync for the real ledger; use **Refresh status** to see its result. You can also run `python -m tracker sync` in a terminal. Order search includes merchant, product, and order ID. **Edit order** and **Edit refund** allow date and amount corrections. Edits keep a previous value and an **Undo** action. Imported orders protect only edited fields; conflicting later email values appear in **Needs review**. **Mark checked** acknowledges a review item; a failed email still retries and reappears if it fails again. **Ignore email** separately stops retries. Suspected duplicate refunds are held from totals until confirmed as distinct or ignored. Manual purchases support multiple items and categories. A manual refund may specify returned item amounts that total the refund; otherwise its category effect stays unallocated. Mistaken manual records can be archived and restored.
+The real dashboard syncs when it starts and every 30 minutes while it is running. Use `--sync-minutes 0` to disable this or another positive interval; the demo never syncs. **Sync now** also starts a background sync, and **Refresh status** shows its result. Order search includes merchant, product, and order ID. **Edit order** and **Edit refund** allow date and amount corrections, with **Undo** for the last change. Imported orders protect edited fields; conflicting email values appear in **Needs review**. Failed emails retry on the next scan. Suspected duplicate refunds stay out of totals until reviewed. **Add manually** opens forms for online-paid purchases and refunds; cash and cash-on-delivery purchases are outside this tracker. The monthly budget is optional and stored separately from purchases.
 
 For an existing ledger without proven sync account history, check its ownership and run `python -m tracker bind-account` once before syncing. A ledger is bound to one `GMAIL_ACCOUNT`; use `python -m tracker --database data/another-account.sqlite3 sync` for a separate account. To re-read known historical refund notices for item evidence, run `python -m tracker recheck-refunds --limit 100`. This calls Gmail and Gemini, saves only extracted item evidence, and leaves ambiguous allocations for review.
 
@@ -27,7 +27,7 @@ python -m tracker export --output /path/to/folder
 python -m tracker backup --output /path/to/backup.sqlite3
 ```
 
-Exports include internal cent amounts and IDs so they can be reconciled. Exports and backups refuse to overwrite existing files. The default output paths are inside ignored `data/`; keep custom exports and backups private.
+Exports include internal cent amounts and IDs so they can be reconciled. Text beginning like a spreadsheet formula is prefixed with an apostrophe in CSV only. Exports and backups refuse to overwrite existing files. The default output paths are inside ignored `data/`; keep custom exports and backups private.
 
 ### Restore a backup
 
@@ -55,7 +55,6 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 python -m tracker auth
-python -m tracker sync
 python -m tracker serve
 ```
 
@@ -73,12 +72,15 @@ On first authorization, choose the same Google account as `GMAIL_ACCOUNT`. The a
 
 - Each order ID is unique within its shop in SQLite. A re-run skips processed Gmail IDs; later order events update the same order. Older emails cannot overwrite newer state.
 - The per-order paid amount is the expense source of truth; each order ID is counted once.
+- New emails that explicitly show cash or cash on delivery, or an order that is only placed, do not create expenses. An unconfirmed payment method appears in **Needs review** and stays out of totals. Existing saved orders are not silently reclassified; check older cash-on-delivery entries yourself.
 - Order amounts remain the amount paid, including for later cancelled or refunded orders. Refunds are recorded separately and subtracted from net spending on their refund date. Shopee's **Return/Refund under review** notice is pending; an approved **Review result for request** supplies the amount and request ID. For TikTok Shop, the refund summary's final total is used. Missing refund amounts appear in **Needs review**. A possible duplicate refund stays out of totals until reviewed.
 - Shopee coins used are tracked separately from vouchers and other discounts. Product Protection Subtotal is added to the Shopee order calculation, while the dashboard continues to count only the actual amount paid. The order check uses items + shipping + product protection − discounts − coins used = paid. When a Shopee receipt omits the coin line but its stated subtotal, vouchers, shipping, and paid total match the saved order, a positive remaining gap is recorded as **Shopee coins (inferred)**. TikTok Shop credits belong in discounts.
 - Item categories split each order's paid amount in proportion to listed item line prices. Category totals add up to paid purchases, not net spending. A category drilldown shows only matching items and each order's allocated category amount. If item prices are unavailable, the paid amount is **Unallocated**.
 - Shopee item arithmetic and TikTok Shop package summaries are checked against the paid amount. TikTok item prices may already include coupons, so its check uses subtotal + shipping + fees − all coupons instead of subtracting coupons from item prices again. Missing order IDs are flagged or rejected. Failed emails can be retried on the next sync. Check **Needs review** before relying on totals. Positive item-to-paid gaps recorded as Shopee coins used are inferred from arithmetic unless confirmed by the receipt.
 
 The app strips likely address, phone and email details from receipt text before the Gemini call. It does not keep the raw receipt, but redaction is heuristic. Review the code before using it with sensitive mail. Gmail and Gemini API calls require internet access. The free-tier model and quotas may change.
+
+The server listens on `127.0.0.1` and has no public login. Keep it local. A public release needs a separate authenticated web deployment, TLS, separate test and production credentials and databases, and the relevant Google OAuth review before Gmail access is offered outside your test account. Do not expose this local server through a public proxy.
 
 ## Tests
 

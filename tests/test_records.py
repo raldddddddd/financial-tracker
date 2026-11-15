@@ -8,14 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tracker.__main__ import page, serve
+from tracker.__main__ import SyncManager, page, serve
 from tracker.core import (ROOT, add_manual_purchase, add_manual_refund, backup_database,
                           connect, correct_order, correct_refund, dashboard_data, dismiss_review,
                           export_csv, ingest, record_error)
 from tracker.core import run_sync
 from tracker.core import (apply_refund_evidence, archive_record, bind_account, ignore_email,
                           manual_day, record_refund_event, recheck_refunds, resolve_conflict,
-                          resolve_refund_duplicate, undo_change)
+                          resolve_refund_duplicate, set_monthly_budget, undo_change)
 
 
 class RecordTests(unittest.TestCase):
@@ -43,7 +43,9 @@ class RecordTests(unittest.TestCase):
         self.assertIn("Net by category", rendered)
         self.assertIn("Food &amp; Drink</span><strong>₱110.00", rendered)
         self.assertIn("Unallocated refunds</span><strong>-₱30.00", rendered)
-        self.assertIn("Other shop purchase", page(data, csrf_token="test-token"))
+        self.assertIn('<details class="add-card" id="add"><summary>Add manually</summary>', rendered)
+        self.assertIn("What you bought most", rendered)
+        self.assertIn("Rice</strong>", rendered)
         exports = export_csv(self.db, self.root / "export")
         self.assertEqual(len(exports), 3)
         with exports[2].open(encoding="utf-8-sig", newline="") as source:
@@ -57,6 +59,64 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(restored.execute("SELECT paid_cents FROM orders").fetchone()[0], 11000)
         with self.assertRaisesRegex(ValueError, "already exists"):
             backup_database(self.db, backup)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(exports[0].stat().st_mode), 0o600)
+
+    def test_monthly_budget_is_optional_and_does_not_change_purchases(self):
+        order_id = add_manual_purchase(self.db, "Online shop", "2026-11-11", "100.00", "Rice", "Groceries")
+        set_monthly_budget(self.db, "150.00")
+        data = dashboard_data(self.db)
+        self.assertEqual(data["monthly_budget_cents"], 15000)
+        self.assertIn('value="150.00"', page(data, csrf_token="test-token"))
+        with self.assertRaisesRegex(ValueError, "greater than zero"):
+            set_monthly_budget(self.db, "0")
+        self.assertEqual(dashboard_data(self.db)["monthly_budget_cents"], 15000)
+        set_monthly_budget(self.db, "")
+        self.assertIsNone(dashboard_data(self.db)["monthly_budget_cents"])
+        self.assertEqual(self.db.execute("SELECT paid_cents FROM orders WHERE order_id=?", (order_id,)).fetchone()[0], 10000)
+
+    def test_sync_manager_prevents_overlapping_runs(self):
+        with patch("tracker.__main__.subprocess.Popen") as launch:
+            manager = SyncManager(self.root / "expenses.sqlite3")
+            manager.start()
+            launch.return_value.poll.return_value = None
+            with self.assertRaisesRegex(ValueError, "already running"):
+                manager.start()
+            self.assertEqual(launch.call_count, 1)
+            launch.return_value.poll.return_value = 0
+            manager.start()
+            self.assertEqual(launch.call_count, 2)
+
+    def test_sync_manager_starts_immediately_then_waits_for_interval(self):
+        manager = SyncManager(self.root / "expenses.sqlite3")
+        with patch.object(manager, "start") as start, \
+             patch.object(manager.stopped, "wait", side_effect=lambda _seconds: manager.stopped.set()) as wait:
+            manager.repeat(30)
+        start.assert_called_once_with()
+        wait.assert_called_once_with(1800)
+
+    def test_csv_export_quotes_formula_like_email_fields(self):
+        add_manual_purchase(self.db, "=HYPERLINK(\"bad\")", "2026-11-11", "10.00", "+unsafe item", "Other")
+        export_csv(self.db, self.root / "export")
+        with (self.root / "export" / "orders.csv").open(encoding="utf-8-sig", newline="") as source:
+            self.assertEqual(next(csv.DictReader(source))["merchant"], "'=HYPERLINK(\"bad\")")
+        with (self.root / "export" / "items.csv").open(encoding="utf-8-sig", newline="") as source:
+            self.assertEqual(next(csv.DictReader(source))["name"], "'+unsafe item")
+
+    def test_failed_export_removes_partial_files(self):
+        class FailingDB:
+            calls = 0
+
+            def execute(inner, query):
+                inner.calls += 1
+                if inner.calls == 2:
+                    raise sqlite3.OperationalError("simulated export failure")
+                return self.db.execute(query)
+
+        folder = self.root / "partial"
+        with self.assertRaisesRegex(sqlite3.OperationalError, "simulated"):
+            export_csv(FailingDB(), folder)
+        self.assertEqual(list(folder.iterdir()), [])
 
     def test_custom_database_keeps_parent_permissions_and_secures_file(self):
         shared = self.root / "shared"

@@ -87,6 +87,37 @@ def filter_refunds(refunds: list[dict], period: PeriodSelection) -> list[dict]:
     return [refund for refund in refunds if period.start <= refund_day(refund) <= period.end]
 
 
+def top_products(orders: list[dict], limit: int = 5) -> list[tuple[str, str, int, int]]:
+    products: dict[tuple[str, str], list] = {}
+    for order in orders:
+        items = order["items"]
+        paid = order["paid_cents"] or 0
+        if not paid or not items or any(item["line_cents"] is None for item in items):
+            continue
+        item_total = sum(item["line_cents"] for item in items)
+        if item_total <= 0:
+            continue
+        assigned = 0
+        for index, item in enumerate(items):
+            amount = paid - assigned if index == len(items) - 1 else paid * item["line_cents"] // item_total
+            assigned += amount
+            key = (item["name"].strip().casefold(), item["category"])
+            product = products.setdefault(key, [item["name"], item["category"], 0, 0])
+            product[2] += amount
+            product[3] += item["quantity"]
+    return [tuple(product) for product in sorted(products.values(), key=lambda product: -product[2])[:limit]]
+
+
+def month_net(orders: list[dict], refunds: list[dict], month: date) -> int:
+    def same_month(day: date) -> bool:
+        return day.year == month.year and day.month == month.month
+
+    return (sum(order["paid_cents"] or 0 for order in orders
+                if same_month(order_day(order)))
+            - sum(refund["amount_cents"] for refund in refunds
+                  if same_month(refund_day(refund))))
+
+
 def trend_series(orders: list[dict], period: PeriodSelection,
                  refunds: list[dict] = (), group_by: str = "year") -> tuple[str, list[tuple[str, int]]]:
     """Return net spending by purchase date and refund date, including empty periods."""

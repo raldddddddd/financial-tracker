@@ -66,6 +66,38 @@ class TrackerTests(unittest.TestCase):
         self.assertNotIn("Shopee coins —", page(data))
         self.assertNotIn("Shopee coins ₱0.00", page(data))
 
+    def test_only_confirmed_online_payments_enter_new_purchase_totals(self):
+        for suffix, method, status, source in (
+            ("COD", "online", "paid", "Order DIGITAL-COD\nPayment Method: COD"),
+            ("UNKNOWN", "unknown", "paid", ""),
+            ("PLACED", "unknown", "placed", ""),
+            ("ONLINE", "online", "paid", ""),
+        ):
+            order = json.loads(json.dumps(self.fixture["orders"][0]))
+            order["order_id"] = f"DIGITAL-{suffix}"
+            order["status"] = status
+            order["payment_method"] = method
+            ingest(self.db, suffix.lower(), 1000, "Order update", {"orders": [order]}, source)
+        data = dashboard_data(self.db)
+        self.assertEqual(data["total_cents"], 102500)
+        self.assertEqual([order["order_id"] for order in data["orders"]], ["DIGITAL-ONLINE"])
+        self.assertEqual([(issue["code"], issue["order_id"]) for issue in data["issues"]],
+                         [("payment_unverified", "DIGITAL-UNKNOWN")])
+
+    def test_product_spend_splits_paid_total_across_items(self):
+        order = json.loads(json.dumps(self.fixture["orders"][0]))
+        order["paid_total"] = "100.00"
+        order["discount_total"] = "20.00"
+        order["items"] = [
+            {"name": "Keyboard", "quantity": 1, "unit_price": "80.00", "line_total": "80.00", "category": "Electronics"},
+            {"name": "Mouse", "quantity": 1, "unit_price": "40.00", "line_total": "40.00", "category": "Electronics"},
+        ]
+        ingest(self.db, "products", 1000, "Payment confirmed", {"orders": [order]})
+        rendered = page(dashboard_data(self.db))
+        self.assertIn("Keyboard</strong><small>Electronics · 1 item</small></div><span>₱66.66", rendered)
+        self.assertIn("Mouse</strong><small>Electronics · 1 item</small></div><span>₱33.34", rendered)
+        self.assertIn("Recorded discounts</span><strong>₱20.00", rendered)
+
     def test_receipt_order_id_repairs_one_missing_extraction(self):
         order = json.loads(json.dumps(self.fixture["orders"][0]))
         order["order_id"] = ""
