@@ -1,12 +1,14 @@
 import csv
+import io
 import json
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tracker.__main__ import page
+from tracker.__main__ import page, serve
 from tracker.core import (ROOT, add_manual_purchase, add_manual_refund, backup_database,
                           connect, correct_order, correct_refund, dashboard_data, dismiss_review,
                           export_csv, ingest, record_error)
@@ -55,6 +57,110 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(restored.execute("SELECT paid_cents FROM orders").fetchone()[0], 11000)
         with self.assertRaisesRegex(ValueError, "already exists"):
             backup_database(self.db, backup)
+
+    def test_custom_database_keeps_parent_permissions_and_secures_file(self):
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o755)
+        shared.chmod(0o755)
+        with connect(shared / "custom.sqlite3") as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((shared / "custom.sqlite3").stat().st_mode), 0o600)
+
+    def test_dashboard_reports_database_outage(self):
+        class BrokenDB:
+            def execute(self, *_args):
+                raise sqlite3.OperationalError("disk I/O error")
+
+        handlers = []
+        class CapturedServer:
+            def __init__(self, _address, handler):
+                handlers.append(handler)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def serve_forever(self):
+                pass
+
+        with patch("tracker.__main__.HTTPServer", CapturedServer), \
+             patch("tracker.__main__.secrets.token_urlsafe", return_value="test-token"):
+            serve(BrokenDB(), 0)
+        for path in ("/", "/health", "/order-items?order=one"):
+            handler = object.__new__(handlers[0])
+            handler.path = path
+            responses = []
+            handler.respond = lambda status, body, content_type: responses.append((status, body, content_type))
+            handler.do_GET()
+            self.assertEqual(responses[0][0], 503, path)
+            self.assertIn(b"Database unavailable", responses[0][1])
+        handler = object.__new__(handlers[0])
+        handler.path = "/action"
+        body = b"op=sync&csrf=test-token"
+        handler.headers = {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        responses = []
+        handler.respond = lambda status, body, content_type: responses.append((status, body, content_type))
+        handler.do_POST()
+        self.assertEqual(responses[0][0], 503)
+        with patch("tracker.__main__.HTTPServer", CapturedServer):
+            serve(self.db, 0, self.root / "missing.sqlite3")
+        handler = object.__new__(handlers[-1])
+        handler.path = "/health"
+        responses = []
+        handler.respond = lambda status, body, content_type: responses.append((status, body, content_type))
+        handler.do_GET()
+        self.assertEqual(responses[0][0], 503)
+        with patch("tracker.__main__.HTTPServer", CapturedServer):
+            serve(self.db, 0, self.root / "expenses.sqlite3")
+        handler = object.__new__(handlers[-1])
+        handler.path = "/health"
+        responses = []
+        handler.respond = lambda status, body, content_type: responses.append((status, body, content_type))
+        handler.do_GET()
+        self.assertEqual(responses[0][0], 200)
+
+    def test_manual_merchant_search_and_sync_control(self):
+        add_manual_purchase(self.db, "Corner store", "2026-11-11", "100.00", "Rice", "Groceries")
+        data = dashboard_data(self.db)
+        self.assertIn("1 matching", page(data, search="Corner"))
+        self.assertIn('name="op" value="sync"', page(data, csrf_token="token", can_sync=True))
+
+    def test_sync_action_starts_one_background_process(self):
+        handlers = []
+        class CapturedServer:
+            def __init__(self, _address, handler):
+                handlers.append(handler)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+            def serve_forever(self):
+                pass
+
+        with patch("tracker.__main__.HTTPServer", CapturedServer), \
+             patch("tracker.__main__.secrets.token_urlsafe", return_value="test-token"), \
+             patch("subprocess.Popen") as popen:
+            popen.return_value.poll.return_value = None
+            serve(self.db, 0, self.root / "expenses.sqlite3")
+            for _ in range(2):
+                handler = object.__new__(handlers[0])
+                handler.path = "/action"
+                body = b"op=sync&csrf=test-token"
+                handler.headers = {"Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body))}
+                handler.rfile = io.BytesIO(body)
+                handler.send_response = lambda *_args: None
+                handler.send_header = lambda *_args: None
+                handler.end_headers = lambda: None
+                handler.respond = lambda *_args: None
+                handler.do_POST()
+            self.assertEqual(popen.call_count, 1)
 
     def test_later_refund_clears_old_issue_and_correction_survives_sync(self):
         fixture = json.loads((ROOT / "fixtures" / "two_orders.json").read_text())
@@ -115,6 +221,16 @@ class RecordTests(unittest.TestCase):
         data = dashboard_data(self.db)
         self.assertEqual(data["sync_run"]["state"], "failed")
         self.assertIn("Gmail unavailable", page(data))
+
+    def test_sync_preserves_original_error_if_failure_log_cannot_be_written(self):
+        def fail_after_database_loss(db):
+            db.execute("DROP TABLE sync_runs")
+            db.commit()
+            raise RuntimeError("Gmail unavailable")
+
+        with patch("tracker.core.sync", side_effect=fail_after_database_loss):
+            with self.assertRaisesRegex(RuntimeError, "Gmail unavailable"):
+                run_sync(self.db)
 
     def test_existing_database_gains_new_columns_without_losing_records(self):
         legacy_path = self.root / "legacy.sqlite3"

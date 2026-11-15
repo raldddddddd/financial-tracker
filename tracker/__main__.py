@@ -5,6 +5,9 @@ import html
 import json
 import os
 import secrets
+import sqlite3
+import subprocess
+import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -22,7 +25,8 @@ DASHBOARD_JS = Path(__file__).with_name("dashboard.js").read_text(encoding="utf-
 
 def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", start: str = "", end: str = "",
          category: str = "", month: str = "", trend_group: str = "year", search: str = "",
-         csrf_token: str = "", notice: str = "", form_values: dict[str, str] | None = None) -> str:
+         csrf_token: str = "", notice: str = "", form_values: dict[str, str] | None = None,
+         can_sync: bool = False) -> str:
     esc = lambda value: html.escape(str(value))
     form_values = form_values or {}
     def adjustments(order: dict) -> str:
@@ -66,6 +70,7 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
     detail_orders = [order for order in orders if order["category_allocations"].get(category, 0) > 0] if category else orders
     if needle:
         detail_orders = [order for order in detail_orders if needle in order["order_id"].casefold() or
+                         needle in order.get("merchant", "").casefold() or
                          any(needle in item["name"].casefold() for item in order["items"]
                              if not category or item["category"] == category)]
     detail_count = len(detail_orders)
@@ -220,7 +225,7 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
     search_clear = f'<a href="{esc(dashboard_url(search_text="", fragment="#orders"))}">Clear search</a>' if search else ''
     search_form = (f'<form action="/" method="get" class="order-search">{hidden_shop}{hidden_period}{hidden_group}{hidden_category}'
                    f'<label for="order-search">Search orders</label><input id="order-search" name="q" type="search" '
-                   f'placeholder="Product or order ID" value="{esc(search)}" maxlength="200">'
+                   f'placeholder="Merchant, product, or order ID" value="{esc(search)}" maxlength="200">'
                    f'<button type="submit">Search</button>{search_clear}</form>')
     def trend_chart(group: str) -> str:
         granularity, trend = trend_series(orders, period, refunds, group)
@@ -317,6 +322,11 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
         sync_status = f'<p class="sync-status">Last sync: {sync_label} · {sync_detail}</p>'
     else:
         sync_status = f'<p class="sync-status">Last sync: {sync_label} · {len(data["messages"])} failed email(s)</p>'
+    data_through = (datetime.fromtimestamp(data["last_sync_ms"] / 1000, MANILA_TZ).strftime("%b %d, %Y %I:%M %p")
+                    if data.get("last_sync_ms") else "Never synced")
+    sync_controls = (f'<form method="post" action="/action" class="sync-form">{csrf_field}'
+                     '<input type="hidden" name="op" value="sync"><button type="submit">Sync now</button></form>'
+                     '<a href="/">Refresh status</a>') if can_sync else ""
     notice_html = f'<p class="filter-error" role="status">{esc(notice)}</p>' if notice else ""
     order_choices = "".join(f'<option value="{esc(order["order_id"])}">{esc(order.get("merchant") or order["platform"])}</option>'
                             for order in data["orders"])
@@ -359,7 +369,7 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
 <title>{title}</title><style>{DASHBOARD_CSS}</style></head><body><a class="skip-link" href="#main">Skip to content</a><div class="app-shell">
 <aside class="sidebar" aria-label="Dashboard navigation"><div class="brand"><span class="brand-mark" aria-hidden="true">S</span><span>Spendwise</span></div><nav class="side-nav" aria-label="Sections"><a class="current" href="#overview">Overview</a><a href="#orders">Orders</a><a href="#refunds">Refunds</a>{review_nav}{'<a href="#add">Add record</a>' if csrf_token else ''}</nav><div class="sidebar-note"><span class="status-dot"></span>Local dashboard</div></aside>
-<main id="main"><header class="page-header"><h1>{title}</h1></header>{sync_status}{notice_html}
+<main id="main"><header class="page-header"><h1>{title}</h1></header><div class="sync-bar">{sync_status}<span>Last completed scan: {data_through}</span>{sync_controls}</div>{notice_html}
 <nav class="shop-filter" id="shop-filter" aria-label="Filter dashboard by shop"><span class="shop-filter-label">SHOP</span><div class="shop-tabs">{shop_tabs}</div></nav>
 {filter_controls}{review}<div class="grid" id="overview"><section class="card hero-card"><div class="hero-top"><div class="eyebrow">Net spending</div></div><div class="total">{php(total)}</div><p class="hero-caption">{esc(period.label)}</p><div class="hero-rule"></div><div class="hero-bottom"><span>ORDERS TRACKED</span><strong>{order_count}</strong></div></section><section class="card category-card"><div class="section-heading"><h2>Purchase spending by category</h2><div class="category-heading-actions"><span class="section-meta">{len(categories)} categories</span>{category_heading_clear}</div></div>{category_content}{net_category_content}</section></div>
 <div class="metric-strip"><div class="metric-card"><span>Purchases paid</span><strong>{php(paid_total)}</strong></div><div class="metric-card"><span>Refunds recorded</span><strong>{php(refund_total)}</strong></div></div>
@@ -370,8 +380,10 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
 </main></div><script src="/dashboard.js" defer></script></body></html>'''
 
 
-def serve(db, port: int):
+def serve(db, port: int, db_path: Path | None = None, demo: bool = False):
+    db_path = db_path.resolve() if db_path is not None else None
     csrf_token = secrets.token_urlsafe(32)
+    sync_process = None
     class Handler(BaseHTTPRequestHandler):
         def respond(self, status: int, body: bytes, content_type: str):
             self.send_response(status)
@@ -381,7 +393,19 @@ def serve(db, port: int):
             self.end_headers()
             self.wfile.write(body)
 
+        def database_unavailable(self):
+            if urlsplit(self.path).path == "/health":
+                self.respond(503, b'{"ok": false, "error": "Database unavailable"}', "application/json")
+            else:
+                self.respond(503, b"Database unavailable. Check the database file and restart the tracker.", "text/plain; charset=utf-8")
+
         def do_GET(self):
+            try:
+                self.get()
+            except sqlite3.Error:
+                self.database_unavailable()
+
+        def get(self):
             url = urlsplit(self.path)
             if url.path not in ("/", "/health", "/dashboard.js", "/order-items"):
                 self.send_error(404)
@@ -389,6 +413,12 @@ def serve(db, port: int):
             if url.path == "/dashboard.js":
                 body = DASHBOARD_JS.encode()
                 self.respond(200, body, "text/javascript; charset=utf-8")
+                return
+            if db_path is not None and not db_path.is_file():
+                raise sqlite3.OperationalError("Database file is missing")
+            if url.path == "/health":
+                db.execute("SELECT count(*) FROM orders").fetchone()
+                self.respond(200, b'{"ok": true}', "application/json")
                 return
             if url.path == "/order-items":
                 order_id = parse_qs(url.query).get("order", [""])[0]
@@ -411,13 +441,24 @@ def serve(db, port: int):
             month = query.get("month", [""])[0]
             trend_group = query.get("group", ["year"])[0]
             search = query.get("q", [""])[0]
-            body = (json.dumps({"ok": True}) if url.path == "/health" else page(dashboard_data(db), page_number, shop, year, start, end, category, month, trend_group, search, csrf_token)).encode()
-            self.respond(200, body, "application/json" if url.path == "/health" else "text/html; charset=utf-8")
+            notice = "Sync started. Refresh status to see the result." if query.get("sync") == ["started"] else ""
+            body = page(dashboard_data(db), page_number, shop, year, start, end, category, month, trend_group, search,
+                        csrf_token, notice, can_sync=db_path is not None and not demo).encode()
+            self.respond(200, body, "text/html; charset=utf-8")
 
         def do_POST(self):
+            try:
+                self.post()
+            except sqlite3.Error:
+                self.database_unavailable()
+
+        def post(self):
+            nonlocal sync_process
             if self.path != "/action" or self.headers.get("Content-Type", "").split(";", 1)[0] != "application/x-www-form-urlencoded":
                 self.send_error(404)
                 return
+            if db_path is not None and not db_path.is_file():
+                raise sqlite3.OperationalError("Database file is missing")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -431,7 +472,18 @@ def serve(db, port: int):
                 return
             op = fields.get("op")
             try:
-                if op == "purchase":
+                if op == "sync":
+                    if db_path is None or demo:
+                        raise ValueError("Sync is unavailable for this dashboard")
+                    if sync_process and sync_process.poll() is None:
+                        raise ValueError("Sync is already running")
+                    try:
+                        sync_process = subprocess.Popen(
+                            [sys.executable, "-m", "tracker", "--database", str(db_path), "sync"],
+                            cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    except OSError as exc:
+                        raise ValueError("Could not start sync") from exc
+                elif op == "purchase":
                     positions = sorted({int(key.removeprefix("item_name_")) for key in fields
                                         if key.startswith("item_name_") and key.removeprefix("item_name_").isdigit()})
                     items = [{"name": fields.get(f"item_name_{position}", ""),
@@ -466,10 +518,11 @@ def serve(db, port: int):
                 else:
                     raise ValueError("Unknown action")
             except ValueError as exc:
-                self.respond(400, page(dashboard_data(db), csrf_token=csrf_token, notice=str(exc), form_values=fields).encode(), "text/html; charset=utf-8")
+                self.respond(400, page(dashboard_data(db), csrf_token=csrf_token, notice=str(exc), form_values=fields,
+                                       can_sync=db_path is not None and not demo).encode(), "text/html; charset=utf-8")
                 return
             self.send_response(303)
-            self.send_header("Location", "/#" + ("add" if op in ("purchase", "add_refund") else "refunds" if op == "refund" else "review" if op in ("dismiss", "ignore_email", "resolve_duplicate", "resolve_conflict") else "history" if op in ("undo", "restore") else "orders"))
+            self.send_header("Location", "/?sync=started#overview" if op == "sync" else "/#" + ("add" if op in ("purchase", "add_refund") else "refunds" if op == "refund" else "review" if op in ("dismiss", "ignore_email", "resolve_duplicate", "resolve_conflict") else "history" if op in ("undo", "restore") else "orders"))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
@@ -526,8 +579,13 @@ def main():
     elif args.command == "backup":
         print(f"Backup: {backup_database(db, args.output)}")
     elif args.command == "serve":
-        serve(db, args.port)
+        serve(db, args.port, args.database, args.demo)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except sqlite3.Error as exc:
+        raise SystemExit(f"Database unavailable: {exc}") from None
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(f"Tracker unavailable: {exc}") from None

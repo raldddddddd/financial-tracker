@@ -39,11 +39,10 @@ def load_env(path: Path = ROOT / ".env") -> None:
 
 
 def secure_dir(path: Path) -> None:
+    existed = path.exists()
     path.mkdir(parents=True, exist_ok=True)
-    try:
+    if not existed or path in (ROOT / "data", ROOT / ".secrets"):
         path.chmod(0o700)
-    except OSError:
-        pass
 
 
 def money_cents(value, *, allow_blank: bool = True) -> int | None:
@@ -366,13 +365,18 @@ def gemini_extract(receipt_text: str, subject: str, pacer=None, platform: str = 
     try:
         text = "".join(p.get("text", "") for p in result["candidates"][0]["content"]["parts"])
         return json.loads(text)
-    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+    except (KeyError, IndexError, TypeError, AttributeError, json.JSONDecodeError) as exc:
         raise ValueError("Gemini did not return valid structured JSON") from exc
 
 
 def connect(path: Path = ROOT / "data" / "expenses.sqlite3") -> sqlite3.Connection:
     secure_dir(path.parent)
     db = sqlite3.connect(path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        db.close()
+        raise
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript("""
@@ -737,7 +741,8 @@ def shopee_approved_refund(subject: str, text: str) -> dict | None:
 def ingest_shopee_refund_request(db: sqlite3.Connection, gmail_id: str, received_ms: int,
                                  subject: str, parsed: dict, source_text: str) -> str:
     match = re.search(r"(?i)\breview result for request\s*#?([A-Za-z0-9-]{5,50})\b", subject)
-    if not match or not isinstance(parsed, dict) or not isinstance(parsed.get("orders"), list):
+    if (not match or not isinstance(parsed, dict) or not isinstance(parsed.get("orders"), list)
+            or not all(isinstance(order, dict) for order in parsed["orders"])):
         raise ValueError("Shopee review result has no valid refund request")
     request_id = match.group(1)
     matches = [order for order in parsed["orders"]
@@ -782,6 +787,8 @@ def ingest(db: sqlite3.Connection, gmail_id: str, received_ms: int, subject: str
     if not isinstance(parsed, dict) or not isinstance(parsed.get("orders"), list):
         raise ValueError("Structured response has no orders array")
     orders = parsed["orders"]
+    if not all(isinstance(order, dict) for order in orders):
+        raise ValueError("Structured response has an invalid order")
     summary = tiktok_package_summary(source_text) if platform == "TikTok Shop" and len(orders) == 1 else None
     receipt_ids = receipt_order_ids(source_text)
     parsed_ids = [str(order.get("order_id", "")).strip().lstrip("#") for order in orders]
@@ -795,6 +802,11 @@ def ingest(db: sqlite3.Connection, gmail_id: str, received_ms: int, subject: str
     seen: set[str] = set()
     validated = []
     for index, order in enumerate(orders):
+        if (not isinstance(order.get("items", []), list) or
+                not all(isinstance(item, dict) for item in order.get("items", [])) or
+                not isinstance(order.get("refund_items", []), list) or
+                not all(isinstance(item, dict) for item in order.get("refund_items", []))):
+            raise ValueError("Structured response has invalid item details")
         oid = parsed_ids[index]
         if not oid or not re.fullmatch(r"[A-Za-z0-9-]{5,50}", oid):
             found = ", ".join(receipt_ids) if receipt_ids else "none"
@@ -1018,8 +1030,10 @@ class GeminiPacer:
 
 
 def retryable_gmail_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
     status = getattr(getattr(exc, "resp", None), "status", None)
-    if status == 429:
+    if status in (429, 500, 502, 503, 504):
         return True
     if status != 403:
         return False
@@ -1038,9 +1052,12 @@ def gmail_execute(request, units: int, pacer: GmailPacer):
             return request.execute()
         except Exception as exc:
             if not retryable_gmail_error(exc) or attempt == 6:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status is not None:
+                    raise RuntimeError(f"Gmail API returned HTTP {status}") from exc
                 raise
             delay = min(2 ** attempt + random.random(), 64)
-            print(f"Gmail rate limit reached; retrying in {delay:.1f}s")
+            print(f"Gmail temporarily unavailable; retrying in {delay:.1f}s")
             time.sleep(delay)
 
 
@@ -1120,9 +1137,12 @@ def run_sync(db: sqlite3.Connection) -> tuple[int, int]:
     try:
         good, bad = sync(db)
     except Exception as exc:
-        with db:
-            db.execute("UPDATE sync_runs SET completed_ms=?,state='failed',error=? WHERE id=?",
-                       (int(time.time() * 1000), str(exc)[:250], run_id))
+        try:
+            with db:
+                db.execute("UPDATE sync_runs SET completed_ms=?,state='failed',error=? WHERE id=?",
+                           (int(time.time() * 1000), str(exc)[:250], run_id))
+        except sqlite3.Error:
+            pass  # Preserve the original failure if the database also became unavailable.
         raise
     with db:
         db.execute("""UPDATE sync_runs SET completed_ms=?,state='completed',

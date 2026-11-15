@@ -191,7 +191,12 @@ td small { display: block; max-width: 560px; margin-top: 6px; color: #81908a; fo
 .review-card code { overflow-wrap: anywhere; }
 .review-card a { color: #8a542b; }
 .review-count { color: #a96e3e; font-size: 12px; font-weight: 750; white-space: nowrap; }
-.sync-status { margin: -18px 0 20px; color: #667970; font-size: 12px; }
+.sync-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin: -18px 0 20px; color: #667970; font-size: 12px; }
+.sync-bar .sync-status { margin: 0; }
+.sync-form { margin: 0 0 0 auto; }
+.sync-form button { padding: 7px 12px; border: 0; border-radius: 6px; background: #2d705c; color: #fff; font: inherit; font-weight: 750; cursor: pointer; }
+.sync-form button:hover { background: #205441; }
+.sync-bar a { color: #2a735e; font-weight: 750; }
 .edit-record { margin-top: 9px; color: #2b705c; font-size: 12px; }
 .edit-record summary, .net-category summary { cursor: pointer; font-weight: 750; }
 .edit-record form, .add-forms form { display: grid; grid-template-columns: repeat(2, minmax(130px, 1fr)); gap: 10px; margin-top: 12px; }
@@ -258,7 +263,7 @@ footer { max-width: 850px; padding: 27px 4px 0; color: #9aa59d; font-size: 11px;
   .category-legend { width: 100%; }
   .line-chart { min-width: 490px; }
   .trend-card { overflow-x: auto; }
-  .sync-status { margin-top: -8px; }
+  .sync-bar { margin-top: -8px; }
   .add-forms { grid-template-columns: 1fr; }
   .edit-record form, .add-forms form { grid-template-columns: 1fr; }
   .basket-item { grid-template-columns: 1fr; }

@@ -14,7 +14,7 @@ python3 -m tracker serve --demo
 
 Open `http://127.0.0.1:8765`. The dashboard binds only to your computer. The sample lives in `data/demo.sqlite3`; the real ledger is `data/expenses.sqlite3`. Shop tabs and date filters apply to purchases and refunds together. Net spending is paid purchases minus counted refunds. The category pie shows gross paid purchases. **Net by category** deducts refunds only where returned item evidence supports a category; the rest appear as **Unallocated refunds**. Search narrows the Orders table without changing dashboard totals. Dates use Asia/Manila time.
 
-The dashboard shows the last scan and failed email count. Run `python -m tracker sync` to refresh it. **Edit order** and **Edit refund** allow date and amount corrections. Edits keep a previous value and an **Undo** action. Imported orders protect only edited fields; conflicting later email values appear in **Needs review**. **Mark checked** acknowledges a review item; a failed email still retries and reappears if it fails again. **Ignore email** separately stops retries. Suspected duplicate refunds are held from totals until confirmed as distinct or ignored. Manual purchases support multiple items and categories. A manual refund may specify returned item amounts that total the refund; otherwise its category effect stays unallocated. Mistaken manual records can be archived and restored.
+The dashboard shows the last sync attempt, the last successful scan, and failed email count. **Sync now** starts a background sync for the real ledger; use **Refresh status** to see its result. You can also run `python -m tracker sync` in a terminal. Order search includes merchant, product, and order ID. **Edit order** and **Edit refund** allow date and amount corrections. Edits keep a previous value and an **Undo** action. Imported orders protect only edited fields; conflicting later email values appear in **Needs review**. **Mark checked** acknowledges a review item; a failed email still retries and reappears if it fails again. **Ignore email** separately stops retries. Suspected duplicate refunds are held from totals until confirmed as distinct or ignored. Manual purchases support multiple items and categories. A manual refund may specify returned item amounts that total the refund; otherwise its category effect stays unallocated. Mistaken manual records can be archived and restored.
 
 For an existing ledger without proven sync account history, check its ownership and run `python -m tracker bind-account` once before syncing. A ledger is bound to one `GMAIL_ACCOUNT`; use `python -m tracker --database data/another-account.sqlite3 sync` for a separate account. To re-read known historical refund notices for item evidence, run `python -m tracker recheck-refunds --limit 100`. This calls Gmail and Gemini, saves only extracted item evidence, and leaves ambiguous allocations for review.
 
@@ -28,6 +28,18 @@ python -m tracker backup --output /path/to/backup.sqlite3
 ```
 
 Exports include internal cent amounts and IDs so they can be reconciled. Exports and backups refuse to overwrite existing files. The default output paths are inside ignored `data/`; keep custom exports and backups private.
+
+### Restore a backup
+
+Stop the dashboard and any sync first. Copy a backup to a **new** filename and check it before replacing the working ledger:
+
+```bash
+cp data/backup-YYYYMMDD-HHMMSS.sqlite3 data/restore-check.sqlite3
+python -c 'import sqlite3; db=sqlite3.connect("data/restore-check.sqlite3"); print(db.execute("PRAGMA quick_check").fetchone()[0])'
+python -m tracker --database data/restore-check.sqlite3 serve
+```
+
+Confirm that `quick_check` prints `ok` and the dashboard totals and review items match the backup you intended. Stop that dashboard. Move the current `data/expenses.sqlite3` aside, then move the checked copy to `data/expenses.sqlite3`. Keep a separate copy of the backup outside this project in case the computer or project folder is lost. The CSV export does not contain every review and correction table; use the SQLite backup for full recovery.
 
 ## Connect your Gmail account
 
@@ -49,7 +61,7 @@ python -m tracker serve
 
 In a new terminal session, activate `.venv` again or run commands directly with `./.venv/bin/python`, for example `./.venv/bin/python -m tracker sync`.
 
-The first sync with Shopee and TikTok Shop searches the full matching Gmail history, even if an older Shopee-only checkpoint exists. It spaces Gmail requests to stay within the per-user quota and retries temporary rate-limit errors. After a complete scan, the app saves one scan start time in SQLite for both shops. Later syncs search only mail received since that time, with a 60-second overlap, and retry any emails that previously failed to parse. Each processed email is saved immediately, so an interrupted sync can resume without parsing it again. Changing sender settings or either search query triggers another full scan. Changing the Gmail account requires a separate database. Refresh the dashboard after sync completes.
+The first sync with Shopee and TikTok Shop searches the full matching Gmail history, even if an older Shopee-only checkpoint exists. It spaces Gmail requests to stay within the per-user quota and retries temporary rate limits, server errors, and connection timeouts. After a complete scan, the app saves one scan start time in SQLite for both shops. Later syncs search only mail received since that time, with a 60-second overlap, and retry any emails that previously failed to parse. Each processed email is saved immediately, so an interrupted sync can resume without parsing it again. A Gmail outage leaves the earlier checkpoint in place; a Gemini failure puts that email in **Needs review** for retry. A database outage returns HTTP 503 from the dashboard and health endpoint. Changing sender settings or either search query triggers another full scan. Changing the Gmail account requires a separate database. Refresh the dashboard after sync completes.
 
 On first authorization, choose the same Google account as `GMAIL_ACCOUNT`. The app checks the authorized account before syncing. OAuth tokens are stored in `.secrets/token.json` with owner-only file permissions. Set `.secrets/credentials.json` to owner-only permissions too (`chmod 600 .secrets/credentials.json`). `.env`, `.secrets/`, and `data/` are Git ignored. Never commit any of them.
 

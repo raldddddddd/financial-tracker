@@ -554,6 +554,8 @@ Total Payment:
             self.assertEqual(gmail_execute(request, 60, pacer), {"ok": True})
         self.assertEqual(pacer.units, [60, 60])
         self.assertFalse(retryable_gmail_error(FakeHttpError(403, "dailyLimitExceeded")))
+        self.assertTrue(retryable_gmail_error(FakeHttpError(503, "backendError")))
+        self.assertTrue(retryable_gmail_error(TimeoutError("request timed out")))
 
     def test_gemini_temporary_failure_is_retried(self):
         response = {"candidates": [{"content": {"parts": [{"text": '{"orders":[]}'}]}}]}
@@ -563,6 +565,18 @@ Total Payment:
              patch("tracker.core.time.sleep"):
             self.assertEqual(gemini_extract("synthetic receipt", "Order paid")["orders"], [])
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_gemini_malformed_parts_are_a_reviewable_error(self):
+        response = {"candidates": [{"content": {"parts": None}}]}
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
+             patch("tracker.core.urlopen", return_value=io.BytesIO(json.dumps(response).encode())):
+            with self.assertRaisesRegex(ValueError, "valid structured JSON"):
+                gemini_extract("synthetic receipt", "Order paid")
+
+    def test_malformed_extracted_orders_are_reviewable(self):
+        with self.assertRaisesRegex(ValueError, "invalid order"):
+            ingest(self.db, "broken", 1000, "Payment confirmed", {"orders": [None]})
+        self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
 
     def test_sync_saves_progress_before_later_fetch_fails(self):
         receipt = b"Order DEMO-ORDER-0001"
