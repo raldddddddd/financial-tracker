@@ -317,15 +317,12 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
                      '<input type="hidden" name="op" value="sync"><button type="submit">Sync now</button></form>'
                      '<a href="/">Refresh status</a>') if can_sync else ""
     review_link = f'<a href="#review">{review_count} to review</a>' if review_count else ""
-    coverage = ('<div class="coverage-note">Email sources: Shopee and TikTok Shop. Check cash-on-delivery orders and missing receipts.'
-                f'{review_link}</div>') if not demo else ''
     last_scan = f'<span>Last completed scan: {data_through}</span>' if data.get("last_sync_ms") else ''
-    sync_bar = f'<div class="sync-bar">{sync_status}{last_scan}{sync_controls}</div>' if not demo else ''
+    sync_bar = f'<div class="sync-bar">{sync_status}{last_scan}{review_link}{sync_controls}</div>' if not demo else ''
     product_rows = "".join(
         f'<li><div><strong>{esc(name)}</strong><small>{esc(category)} · {quantity} item{"s" if quantity != 1 else ""}</small></div><span>{php(amount)}</span></li>'
         for name, category, amount, quantity in products)
     product_card = (f'<section class="card product-card" id="products"><div class="section-heading"><h2>Top products by spend</h2><span class="section-meta">{esc(period.label)}</span></div>'
-                    f'<p class="insight-note">Paid amounts are split across priced items in each order. Unitemized orders are excluded.</p>'
                     f'<ol class="product-list">{product_rows}</ol></section>' if product_rows else
                     '<section class="card product-card" id="products"><div class="section-heading"><h2>Top products by spend</h2></div>'
                     '<p class="empty-state">Itemized paid purchases will appear here after a sync or manual entry.</p></section>')
@@ -391,7 +388,7 @@ def page(data: dict, page_number: int = 1, shop: str = "all", year: str = "", st
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
 <title>{title} · Spendwise</title><style>{DASHBOARD_CSS}</style></head><body><a class="skip-link" href="#main">Skip to content</a><div class="app-shell">
 <aside class="sidebar" aria-label="Dashboard navigation"><div class="brand">spendwise<span class="brand-dot">.</span></div><nav class="side-nav" aria-label="Sections"><a href="#overview">Overview</a><a href="#budget">Budget</a><a href="#products">Products</a><a href="#orders">Purchases</a><a href="#refunds">Refunds</a>{review_nav}</nav></aside>
-<main id="main"><div class="page-top"><header class="page-header"><h1>{title}</h1>{'<p class="page-context">Sample data</p>' if demo else ''}</header>{add_section}</div>{sync_bar}{notice_html}{coverage}
+<main id="main"><div class="page-top"><header class="page-header"><h1>{title}</h1>{'<p class="page-context">Sample data</p>' if demo else ''}</header>{add_section}</div>{sync_bar}{notice_html}
 <nav class="shop-filter" id="shop-filter" aria-label="Filter dashboard by shop"><div class="shop-tabs">{shop_tabs}</div></nav>
 {filter_controls}{review}<div class="grid" id="overview"><section class="card hero-card"><div class="hero-top"><div class="eyebrow">Net spending</div></div><div class="total">{php(total)}</div><p class="hero-caption">{esc(period.label)}</p><div class="hero-rule"></div><div class="hero-bottom"><span>ORDERS TRACKED</span><strong>{order_count}</strong></div></section><section class="card category-card"><div class="section-heading"><h2>Purchase spending by category</h2><div class="category-heading-actions">{category_heading_clear}</div></div>{category_content}{net_category_content}</section></div>
 <div class="metric-strip"><div class="metric-card"><span>Purchases paid</span><strong>{php(paid_total)}</strong></div><div class="metric-card"><span>Refunds recorded</span><strong>{php(refund_total)}</strong></div>{discounts_metric}</div>
