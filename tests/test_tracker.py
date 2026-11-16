@@ -9,8 +9,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from tracker.core import ROOT, SHOPEE_QUERY, TIKTOK_QUERY, connect, dashboard_data, gemini_extract, gmail_execute, ingest, is_shopee_confirmation, is_shop_confirmation, mime_text, retryable_gmail_error, sanitize_receipt, shopee_approved_refund, sync
-from tracker.__main__ import page
+from tracker.core import ROOT, ingest, is_shopee_confirmation, is_shop_confirmation, mime_text, sanitize_receipt, shopee_approved_refund
+from tracker.dashboard import page
+from tracker.insights import dashboard_data, select_dashboard
+from tracker.storage import connect
+from tracker.sync import SHOPEE_QUERY, TIKTOK_QUERY, gemini_extract, gmail_execute, retryable_gmail_error, sync
 
 
 class FakeCall:
@@ -58,9 +61,9 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(ingest(self.db, "email-1", 1000, "Payment confirmed", self.fixture), "processed 2 order(s)")
         self.assertEqual(ingest(self.db, "email-1", 1000, "Payment confirmed", self.fixture), "already processed")
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 209700)
+        self.assertEqual(select_dashboard(data).total, 209700)
         self.assertEqual(len(data["orders"]), 2)
-        self.assertEqual(data["categories"]["Pet Supplies"], 209700)
+        self.assertEqual(select_dashboard(data).categories["Pet Supplies"], 209700)
         self.assertNotIn("Needs review", page(data))
         self.assertNotIn("Combined payments", page(data))
         self.assertNotIn("Shopee coins —", page(data))
@@ -79,7 +82,7 @@ class TrackerTests(unittest.TestCase):
             order["payment_method"] = method
             ingest(self.db, suffix.lower(), 1000, "Order update", {"orders": [order]}, source)
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 102500)
+        self.assertEqual(select_dashboard(data).total, 102500)
         self.assertEqual([order["order_id"] for order in data["orders"]], ["DIGITAL-ONLINE"])
         self.assertEqual([(issue["code"], issue["order_id"]) for issue in data["issues"]],
                          [("payment_unverified", "DIGITAL-UNKNOWN")])
@@ -153,9 +156,9 @@ class TrackerTests(unittest.TestCase):
         ingest(self.db, "email-2", 2000, "Refund", refund)
         cancel = {"orders": [{"order_id": "DEMO-ORDER-0002", "status": "cancelled", "paid_total": "", "shipping_fee": "", "protection_subtotal": "", "discount_total": "", "coins_used": "", "refund_amount": "", "items": []}]}
         ingest(self.db, "email-3", 3000, "Cancelled", cancel)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 197200)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, 197200)
         ingest(self.db, "older", 500, "Payment confirmed", self.fixture)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 197200)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, 197200)
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='unknown_refund'").fetchone()[0], 1)
 
     def test_shopee_refund_waits_for_review_result(self):
@@ -182,7 +185,7 @@ class TrackerTests(unittest.TestCase):
         self.assertIn("Request DEMO-ORDER-0001", dashboard)
         self.assertIn("₱125.00", dashboard)
         self.assertNotIn("Approved refund needs order link", dashboard)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 90000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, 90000)
 
     def test_shopee_review_result_without_amount_needs_review(self):
         event = {"orders": [{"order_id": "DEMO-ORDER-0001", "status": "refunded",
@@ -222,6 +225,7 @@ class TrackerTests(unittest.TestCase):
                 VALUES (?,?,?,?,?,?,?)""", ("DEMO-ORDER-0001", 3000, 3000, "partial_refund", 25800, "result", "Shopee"))
             self.db.execute("INSERT INTO issues VALUES (?,?,?,?)",
                             ("result", "DEMO-ORDER-0001", "orphan_event", "No paid order"))
+            self.db.execute("PRAGMA user_version=0")
         self.db.close()
         self.db = connect(Path(self.temp.name) / "data" / "test.sqlite3")
         self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
@@ -236,12 +240,13 @@ class TrackerTests(unittest.TestCase):
                             (paid["order_id"],))
             self.db.execute("INSERT INTO messages VALUES (?,?,?,?,?)", ("old-refund", 3000, "Refund", "processed", None))
             self.db.execute("INSERT INTO refund_requests VALUES (?,?,?,?,?)", ("REQUEST-1", 4000, 25800, "request-mail", None))
+            self.db.execute("PRAGMA user_version=0")
         self.db.close()
         path = Path(self.temp.name) / "data" / "test.sqlite3"
         self.db = connect(path)
         self.assertEqual(self.db.execute("SELECT refund_cents FROM orders").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT count(*),sum(amount_cents) FROM refund_events").fetchone()[:], (2, 73000))
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 102500 - 73000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, 102500 - 73000)
         self.db.close()
         self.db = connect(path)
         self.assertEqual(self.db.execute("SELECT count(*),sum(amount_cents) FROM refund_events").fetchone()[:], (2, 73000))
@@ -251,10 +256,10 @@ class TrackerTests(unittest.TestCase):
                              "paid_total": "", "refund_amount": "25.00", "items": []}]}
         ingest(self.db, "refund", 2000, "Refund", event)
         self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
-        self.assertEqual(dashboard_data(self.db)["total_cents"], -2500)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, -2500)
         self.assertEqual(ingest(self.db, "refund", 2000, "Refund", event), "already processed")
         ingest(self.db, "paid", 1000, "Payment confirmed", {"orders": [self.fixture["orders"][0]]})
-        self.assertEqual(dashboard_data(self.db)["total_cents"], 100000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).total, 100000)
         self.assertEqual(self.db.execute("SELECT count(*) FROM refund_events").fetchone()[0], 1)
 
     def test_distinct_refunds_for_one_order_add_without_changing_categories(self):
@@ -264,10 +269,10 @@ class TrackerTests(unittest.TestCase):
                                  "paid_total": "", "refund_amount": amount, "items": []}]}
             ingest(self.db, gmail_id, timestamp, "Refund", event)
         data = dashboard_data(self.db)
-        self.assertEqual(data["paid_total_cents"], 102500)
-        self.assertEqual(data["refund_total_cents"], 3500)
-        self.assertEqual(data["total_cents"], 99000)
-        self.assertEqual(data["categories"], {"Pet Supplies": 102500})
+        self.assertEqual(select_dashboard(data).paid_total, 102500)
+        self.assertEqual(select_dashboard(data).refund_total, 3500)
+        self.assertEqual(select_dashboard(data).total, 99000)
+        self.assertEqual(select_dashboard(data).categories, {"Pet Supplies": 102500})
         self.assertEqual(self.db.execute("SELECT count(*) FROM refund_events").fetchone()[0], 2)
         self.assertEqual(self.db.execute("SELECT refund_cents FROM orders").fetchone()[0], 0)
 
@@ -281,8 +286,8 @@ class TrackerTests(unittest.TestCase):
         ingest(self.db, "result", 2000, "Review result for request REQUEST-1", result,
                "Request REQUEST-1 refund was approved for ₱10.00")
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 9001)
-        self.assertEqual(data["categories"], {"Pet Supplies": 6667, "Groceries": 3334})
+        self.assertEqual(select_dashboard(data).total, 9001)
+        self.assertEqual(select_dashboard(data).categories, {"Pet Supplies": 6667, "Groceries": 3334})
         html = page(data, category="Pet Supplies")
         self.assertIn('<div class="total">₱90.01</div>', html)
         self.assertIn('Category paid: ₱66.67', html)
@@ -304,6 +309,7 @@ class TrackerTests(unittest.TestCase):
                 VALUES (?,?,?,?,?,?,?)""", ("DEMO-ORDER-0001", 1000, 1000, "refunded", 0, "pending", "Shopee"))
             self.db.execute("INSERT INTO issues VALUES (?,?,?,?)",
                             ("pending", "DEMO-ORDER-0001", "orphan_event", "Pending notice"))
+            self.db.execute("PRAGMA user_version=0")
         self.db.close()
         self.db = connect(Path(self.temp.name) / "data" / "test.sqlite3")
         self.assertEqual(self.db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
@@ -330,6 +336,7 @@ class TrackerTests(unittest.TestCase):
         self.assertNotIn('<th class="number">Net</th>', shopee_view)
         self.assertIn('<td class="number strong">₱500.00</td>', shopee_view)
         self.assertIn('<div class="total">₱450.00</div>', shopee_view)
+        self.assertIn('<small class="order-status-mobile">Status: partial refund</small>', shopee_view)
         self.assertIn('Pet Supplies</span><strong>₱500.00</strong>', shopee_view)
         self.assertIn('<section class="card" id="refunds">', shopee_view)
         self.assertIn('<h2>Refunds</h2><strong>₱50.00</strong>', shopee_view)
@@ -340,6 +347,7 @@ class TrackerTests(unittest.TestCase):
         self.assertIn('<h2>Refunds</h2><strong>₱25.00</strong>', tiktok_view)
         self.assertNotIn('₱50.00', tiktok_view)
         all_view = page(dashboard_data(self.db))
+        self.assertIn('<h2>By shop</h2>', all_view)
         self.assertIn('<div class="total">₱625.00</div>', all_view)
         self.assertIn('<h2>Refunds</h2><strong>₱75.00</strong>', all_view)
 
@@ -376,20 +384,20 @@ Total (1 item)
         ingest(self.db, "shopee-email", 1000, "Payment confirmed", {"orders": [shopee_order]}, "Order DEMO-ORDER-0001")
         ingest(self.db, "tiktok-email", 2000, "TikTok Shop order", {"orders": [tiktok_order]}, "Order DEMO-ORDER-0001", platform="TikTok Shop")
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 120000)
+        self.assertEqual(select_dashboard(data).total, 120000)
         self.assertEqual({order["platform"] for order in data["orders"]}, {"Shopee", "TikTok Shop"})
         self.assertIn('<span class="shop-tag shop-tiktok">TikTok Shop</span><strong>DEMO-ORDER-0001</strong>', page(data))
         self.assertIn('<span class="shop-tag shop-shopee">Shopee</span><strong>DEMO-ORDER-0001</strong>', page(data))
         tiktok_view = page(data, shop="tiktok")
         self.assertIn('<h1>TikTok Shop spending</h1>', tiktok_view)
         self.assertIn('<div class="total">₱200.00</div>', tiktok_view)
-        self.assertIn('<span class="category-name">Electronics</span>', tiktok_view)
+        self.assertIn('<span>Electronics</span><strong>₱200.00</strong>', tiktok_view)
         self.assertNotIn('<span>Pet Supplies</span>', tiktok_view)
         self.assertNotIn('shop-tag shop-shopee', tiktok_view)
         self.assertNotIn('Shopee coins ₱25.00', tiktok_view)
         shopee_view = page(data, shop="shopee")
         self.assertIn('<div class="total">₱1,000.00</div>', shopee_view)
-        self.assertIn('<span class="category-name">Pet Supplies</span>', shopee_view)
+        self.assertIn('<span>Pet Supplies</span><strong>₱1,000.00</strong>', shopee_view)
         self.assertNotIn('<span>Electronics</span>', shopee_view)
         self.assertNotIn('shop-tag shop-tiktok', shopee_view)
         self.assertIn('Shopee coins ₱25.00', shopee_view)
@@ -494,7 +502,7 @@ Total Payment:
         self.assertEqual(self.db.execute("SELECT coins_cents FROM orders WHERE order_id='DEMO-ORDER-0001'").fetchone()[0], 2500)
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='order_mismatch'").fetchone()[0], 0)
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 207200)
+        self.assertEqual(select_dashboard(data).total, 207200)
         self.assertIn("Shopee coins ₱25.00", page(data))
 
     def test_product_protection_is_in_paid_total_once(self):
@@ -505,7 +513,7 @@ Total Payment:
         self.assertEqual(self.db.execute("SELECT protection_cents FROM orders WHERE order_id='DEMO-ORDER-0001'").fetchone()[0], 900)
         self.assertEqual(self.db.execute("SELECT count(*) FROM issues WHERE code='order_mismatch'").fetchone()[0], 0)
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 210600)
+        self.assertEqual(select_dashboard(data).total, 210600)
         self.assertNotIn("Product Protection", page(data))
 
     def test_negative_gap_cannot_be_resolved_with_coins(self):
@@ -582,7 +590,7 @@ Total Payment:
                 self.units.append(units)
 
         request, pacer = Request(), Pacer()
-        with patch("tracker.core.time.sleep"):
+        with patch("tracker.sync.time.sleep"):
             self.assertEqual(gmail_execute(request, 60, pacer), {"ok": True})
         self.assertEqual(pacer.units, [60, 60])
         self.assertFalse(retryable_gmail_error(FakeHttpError(403, "dailyLimitExceeded")))
@@ -593,15 +601,15 @@ Total Payment:
         response = {"candidates": [{"content": {"parts": [{"text": '{"orders":[]}'}]}}]}
         error = HTTPError("https://example.invalid", 503, "Unavailable", {}, None)
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
-             patch("tracker.core.urlopen", side_effect=[error, io.BytesIO(json.dumps(response).encode())]) as urlopen, \
-             patch("tracker.core.time.sleep"):
+             patch("tracker.sync.urlopen", side_effect=[error, io.BytesIO(json.dumps(response).encode())]) as urlopen, \
+             patch("tracker.sync.time.sleep"):
             self.assertEqual(gemini_extract("synthetic receipt", "Order paid")["orders"], [])
         self.assertEqual(urlopen.call_count, 2)
 
     def test_gemini_malformed_parts_are_a_reviewable_error(self):
         response = {"candidates": [{"content": {"parts": None}}]}
         with patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}), \
-             patch("tracker.core.urlopen", return_value=io.BytesIO(json.dumps(response).encode())):
+             patch("tracker.sync.urlopen", return_value=io.BytesIO(json.dumps(response).encode())):
             with self.assertRaisesRegex(ValueError, "valid structured JSON"):
                 gemini_extract("synthetic receipt", "Order paid")
 
@@ -641,9 +649,9 @@ Total Payment:
                 return Messages()
 
         one_order = {"orders": [self.fixture["orders"][0]]}
-        with patch("tracker.core.gmail_service", return_value=Service()), \
-             patch("tracker.core.gemini_extract", return_value=one_order), \
-             patch("tracker.core.GmailPacer.wait"):
+        with patch("tracker.sync.gmail_service", return_value=Service()), \
+             patch("tracker.sync.gemini_extract", return_value=one_order), \
+             patch("tracker.sync.GmailPacer.wait"):
             with self.assertRaisesRegex(RuntimeError, "fetch failed"):
                 sync(self.db)
         self.assertEqual(self.db.execute("SELECT count(*) FROM messages").fetchone()[0], 1)
@@ -691,10 +699,10 @@ Total Payment:
 
         service = Service()
         one_order = {"orders": [self.fixture["orders"][0]]}
-        with patch("tracker.core.gmail_service", return_value=service), \
-             patch("tracker.core.gemini_extract", side_effect=[one_order, ValueError("temporary parse failure"), one_order, one_order]), \
-             patch("tracker.core.GmailPacer.wait"), \
-             patch("tracker.core.time.time", side_effect=[100.5, 200.5]):
+        with patch("tracker.sync.gmail_service", return_value=service), \
+             patch("tracker.sync.gemini_extract", side_effect=[one_order, ValueError("temporary parse failure"), one_order, one_order]), \
+             patch("tracker.sync.GmailPacer.wait"), \
+             patch("tracker.sync.time.time", side_effect=[100.5, 200.5]):
             self.assertEqual(sync(self.db), (1, 1))
             self.assertEqual(sync(self.db), (2, 0))
 
@@ -745,10 +753,10 @@ Total Payment:
         env = {"GMAIL_ACCOUNT": "owner@example.com", "SHOPEE_SENDER_DOMAIN": "shopee.ph",
                "SHOPEE_QUERY": SHOPEE_QUERY, "TIKTOK_SENDER_EMAIL": "no-reply@shop.tiktok.com", "TIKTOK_QUERY": TIKTOK_QUERY}
         with patch.dict("os.environ", env), \
-             patch("tracker.core.gmail_service", return_value=service), \
-             patch("tracker.core.gemini_extract", return_value=one_order) as extract, \
-             patch("tracker.core.GmailPacer.wait"), \
-             patch("tracker.core.time.time", return_value=200.5):
+             patch("tracker.sync.gmail_service", return_value=service), \
+             patch("tracker.sync.gemini_extract", return_value=one_order) as extract, \
+             patch("tracker.sync.GmailPacer.wait"), \
+             patch("tracker.sync.time.time", return_value=200.5):
             self.assertEqual(sync(self.db), (1, 0))
         self.assertEqual(len(service.searches), 2)
         self.assertTrue(all("after:" not in query for query in service.searches))

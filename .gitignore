@@ -1,6 +1,7 @@
 .env
 .secrets/
 data/
+*.before-schema-v*-to-v*.sqlite3
 __pycache__/
 *.pyc
 .venv/

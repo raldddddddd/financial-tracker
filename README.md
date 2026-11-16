@@ -12,9 +12,9 @@ python3 -m tracker demo
 python3 -m tracker serve --demo
 ```
 
-Open `http://127.0.0.1:8765`. The dashboard binds only to your computer. The sample lives in `data/demo.sqlite3`; the real ledger is `data/expenses.sqlite3`. Shop tabs and date filters apply to purchases and refunds together. Net spending is paid purchases minus counted refunds. The category pie shows gross paid purchases. **Net by category** deducts refunds only where returned item evidence supports a category; the rest appear as **Unallocated refunds**. Search narrows the Orders table without changing dashboard totals. Dates use Asia/Manila time.
+Open `http://127.0.0.1:8765`. The dashboard binds only to your computer. The sample lives in `data/demo.sqlite3`; the real ledger is `data/expenses.sqlite3`. Shop tabs and date filters apply to purchases and refunds together. Net spending is paid purchases minus counted refunds. The category pie shows gross paid purchases. **Net by category** uses the linked purchase category when all items share one category, or returned-item details for mixed-category orders; other refunds appear as **Unallocated refunds**. Search narrows the Orders table without changing dashboard totals. Dates use Asia/Manila time.
 
-The real dashboard syncs when it starts and every 30 minutes while it is running. Use `--sync-minutes 0` to disable this or another positive interval; the demo never syncs. **Sync now** also starts a background sync, and **Refresh status** shows its result. Order search includes merchant, product, and order ID. **Edit order** and **Edit refund** allow date and amount corrections, with **Undo** for the last change. Imported orders protect edited fields; conflicting email values appear in **Needs review**. Failed emails retry on the next scan. Suspected duplicate refunds stay out of totals until reviewed. **Add manually** opens forms for online-paid purchases and refunds; cash and cash-on-delivery purchases are outside this tracker. The monthly budget is optional and stored separately from purchases.
+The real dashboard syncs when it starts and every 30 minutes while it is running. Use `--sync-minutes 0` to disable this or another positive interval; the demo never syncs. **Sync now** also starts a background sync, and **Refresh status** shows its result. Order search includes merchant, product, and order ID. **Edit order** and **Edit refund** allow date and amount corrections, with **Undo** for the last change. Imported orders protect edited fields; conflicting email values appear in **Needs review**. Failed emails retry on the next scan. Suspected duplicate refunds stay out of totals until reviewed. **Add purchase or refund** opens forms for online-paid purchases and refunds; cash and cash-on-delivery purchases are outside this tracker. The monthly budget is optional and stored separately from purchases.
 
 For an existing ledger without proven sync account history, check its ownership and run `python -m tracker bind-account` once before syncing. A ledger is bound to one `GMAIL_ACCOUNT`; use `python -m tracker --database data/another-account.sqlite3 sync` for a separate account. To re-read known historical refund notices for item evidence, run `python -m tracker recheck-refunds --limit 100`. This calls Gmail and Gemini, saves only extracted item evidence, and leaves ambiguous allocations for review.
 
@@ -28,6 +28,8 @@ python -m tracker backup --output /path/to/backup.sqlite3
 ```
 
 Exports include internal cent amounts and IDs so they can be reconciled. Text beginning like a spreadsheet formula is prefixed with an apostrophe in CSV only. Exports and backups refuse to overwrite existing files. The default output paths are inside ignored `data/`; keep custom exports and backups private.
+
+When an older ledger is opened for the first time, the app creates an owner-only SQLite backup beside it before upgrading the schema. For the default ledger, the filename starts with `data/expenses.before-schema-`. A failed upgrade reports that backup's path; restore it using the steps below after stopping the app. Already upgraded ledgers do not create a backup on every launch.
 
 ### Restore a backup
 
@@ -81,6 +83,8 @@ On first authorization, choose the same Google account as `GMAIL_ACCOUNT`. The a
 The app strips likely address, phone and email details from receipt text before the Gemini call. It does not keep the raw receipt, but redaction is heuristic. Review the code before using it with sensitive mail. Gmail and Gemini API calls require internet access. The free-tier model and quotas may change.
 
 The server listens on `127.0.0.1` and has no public login. Keep it local. A public release needs a separate authenticated web deployment, TLS, separate test and production credentials and databases, and the relevant Google OAuth review before Gmail access is offered outside your test account. Do not expose this local server through a public proxy.
+
+For maintenance, `storage.py` owns SQLite setup, upgrades, exports, and backups; `core.py` validates and ingests receipts; `records.py` handles manual ledger changes; `insights.py` prepares read-only dashboard data; `sync.py` handles Gmail and Gemini; and `dashboard.py` renders HTML. `__main__.py` provides the CLI and local HTTP routes.
 
 ## Tests
 

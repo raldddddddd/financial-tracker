@@ -1,9 +1,9 @@
 import unittest
 from datetime import datetime, timezone
 
-from tracker.__main__ import page
+from tracker.dashboard import page
 from tracker.charts import line_chart
-from tracker.insights import filter_period, filter_refunds, order_day, refund_day, resolve_period, trend_series
+from tracker.insights import filter_period, filter_refunds, order_day, refund_day, resolve_period, select_dashboard, trend_series
 
 
 def milliseconds(timestamp):
@@ -43,6 +43,21 @@ class InsightTests(unittest.TestCase):
         self.orders = [self.january, self.december]
         self.refunds = [self.refund]
 
+    def test_selection_keeps_totals_when_search_narrows_orders(self):
+        self.december["items"] = [{"name": "Rice", "quantity": 1, "line_cents": 10000, "category": "Groceries"}]
+        self.january["items"] = [{"name": "Meal", "quantity": 1, "line_cents": 5000, "category": "Food & Drink"}]
+        self.december["category_allocations"] = {"Groceries": 10000}
+        self.january["category_allocations"] = {"Food & Drink": 5000}
+        self.refund["allocations"] = [{"category": "Groceries", "amount_cents": 1200}]
+        selected = select_dashboard(dashboard(self.orders, self.refunds), search="DECEMBER")
+        self.assertEqual([item["order_id"] for item in selected.visible_orders], ["DECEMBER"])
+        self.assertEqual((selected.paid_total, selected.refund_total, selected.total), (15000, 2000, 13000))
+        self.assertEqual(selected.shop_totals, {"Shopee": 8000, "TikTok Shop": 5000})
+        self.assertEqual(selected.net_categories,
+                         {"Groceries": 8800, "Food & Drink": 5000, "Unallocated refunds": -800})
+        only_refund = select_dashboard(dashboard(self.orders, self.refunds), shop="shopee", year="2026")
+        self.assertEqual((only_refund.paid_total, only_refund.refund_total, only_refund.total), (0, 2000, -2000))
+
     def test_refund_uses_approval_year_and_does_not_change_categories(self):
         self.assertEqual(order_day(self.december).isoformat(), "2025-12-31")
         self.assertEqual(order_day(self.january).isoformat(), "2026-01-01")
@@ -67,6 +82,8 @@ class InsightTests(unittest.TestCase):
 
     def test_invalid_and_empty_ranges(self):
         html = page(dashboard(self.orders, self.refunds), start="2026-02-30", end="2026-03-01")
+        for form in ("year-form", "month-form", "range-form"):
+            self.assertIn(f'<form action="/#shop-filter" method="get" class="{form}">', html)
         self.assertIn('role="alert"', html)
         self.assertIn("Enter real dates", html)
         self.assertIn('<div class="total">₱130.00</div>', html)
@@ -174,6 +191,7 @@ class InsightTests(unittest.TestCase):
         other = dict(self.january, items=[{"name": "Cat comb", "quantity": 1, "line_cents": None, "category": "Unallocated"}])
         data = dashboard([whiskas, other], self.refunds)
         by_product = page(data, shop="shopee", category="Unallocated", search="  wHiSkAs  ")
+        self.assertIn('<form action="/#orders" method="get" class="order-search">', by_product)
         self.assertIn('value="wHiSkAs"', by_product)
         self.assertIn('DECEMBER</strong>', by_product)
         self.assertNotIn('JANUARY</strong>', by_product)

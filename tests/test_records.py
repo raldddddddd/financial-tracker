@@ -8,14 +8,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tracker.__main__ import SyncManager, page, serve
-from tracker.core import (ROOT, add_manual_purchase, add_manual_refund, backup_database,
-                          connect, correct_order, correct_refund, dashboard_data, dismiss_review,
-                          export_csv, ingest, record_error)
-from tracker.core import run_sync
-from tracker.core import (apply_refund_evidence, archive_record, bind_account, ignore_email,
-                          manual_day, record_refund_event, recheck_refunds, resolve_conflict,
-                          resolve_refund_duplicate, set_monthly_budget, undo_change)
+from tracker.__main__ import SyncManager, serve
+from tracker.dashboard import page
+from tracker.core import ROOT, apply_refund_evidence, ingest, record_error, record_refund_event
+from tracker.insights import dashboard_data, select_dashboard
+from tracker.records import (add_manual_purchase, add_manual_refund, archive_record,
+                             correct_order, correct_refund, dismiss_review, ignore_email,
+                             manual_day, resolve_conflict, resolve_refund_duplicate,
+                             set_monthly_budget, undo_change)
+from tracker.storage import backup_database, bind_account, connect, export_csv
+from tracker.sync import recheck_refunds, run_sync
 
 
 class RecordTests(unittest.TestCase):
@@ -36,15 +38,15 @@ class RecordTests(unittest.TestCase):
                                           "merchant": "Corner store", "category_0": "Food & Drink"})
         correct_refund(self.db, refund_id, "30.00", order_id)
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 8000)
-        self.assertEqual(data["categories"], {"Food & Drink": 11000})
+        self.assertEqual(select_dashboard(data).total, 8000)
+        self.assertEqual(select_dashboard(data).categories, {"Food & Drink": 11000})
         self.assertEqual(len(data["issues"]), 1)
         rendered = page(data, csrf_token="test-token")
         self.assertIn("Net by category", rendered)
         self.assertIn("Food &amp; Drink</span><strong>₱110.00", rendered)
-        self.assertIn("Unallocated refunds</span><strong>-₱30.00", rendered)
-        self.assertIn('<details class="add-card" id="add"><summary>Add manually</summary>', rendered)
-        self.assertIn("What you bought most", rendered)
+        self.assertIn("Food &amp; Drink</span><strong>₱80.00", rendered)
+        self.assertIn('<details class="add-card" id="add"><summary>Add purchase or refund</summary>', rendered)
+        self.assertIn("Top products by spend", rendered)
         self.assertIn("Rice</strong>", rendered)
         exports = export_csv(self.db, self.root / "export")
         self.assertEqual(len(exports), 3)
@@ -126,6 +128,7 @@ class RecordTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM orders").fetchone()[0], 0)
         self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE((shared / "custom.sqlite3").stat().st_mode), 0o600)
+        self.assertEqual(list(shared.glob("custom.before-schema-*.sqlite3")), [])
 
     def test_dashboard_reports_database_outage(self):
         class BrokenDB:
@@ -188,6 +191,24 @@ class RecordTests(unittest.TestCase):
         data = dashboard_data(self.db)
         self.assertIn("1 matching", page(data, search="Corner"))
         self.assertIn('name="op" value="sync"', page(data, csrf_token="token", can_sync=True))
+
+    def test_demo_page_keeps_actions_and_amounts_clear(self):
+        add_manual_purchase(self.db, "Corner store", "2026-11-11", "100.00", "Rice", "Groceries")
+        rendered = page(dashboard_data(self.db), csrf_token="token", demo=True)
+        self.assertNotIn("Last sync:", rendered)
+        self.assertNotIn("Last completed scan:", rendered)
+        self.assertLess(rendered.index('id="add"'), rendered.index('id="shop-filter"'))
+        self.assertNotIn("Shipping — · discounts —", rendered)
+        self.assertNotIn('aria-label="Orders pages"', rendered)
+        self.assertNotIn('class="order-status-mobile"', rendered)
+        self.assertNotIn("1 categories", rendered)
+        self.assertNotIn("Recorded discounts", rendered)
+        self.assertNotIn("By shop</h2>", rendered)
+        self.assertIn("Sample data", rendered)
+        self.assertIn("Period: All time", rendered)
+        self.assertNotIn('<svg class="category-pie"', rendered)
+        self.assertIn('class="single-trend"', rendered)
+        self.assertNotIn("Net by category", rendered)
 
     def test_sync_action_starts_one_background_process(self):
         handlers = []
@@ -270,12 +291,12 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT order_id FROM refund_events").fetchone()[0], order_id)
 
     def test_sync_result_and_failure_are_visible(self):
-        with patch("tracker.core.sync", return_value=(2, 1)):
+        with patch("tracker.sync.sync", return_value=(2, 1)):
             self.assertEqual(run_sync(self.db), (2, 1))
         data = dashboard_data(self.db)
         self.assertEqual(data["sync_run"]["state"], "completed")
         self.assertIn("2 processed, 1 need review", page(data))
-        with patch("tracker.core.sync", side_effect=RuntimeError("Gmail unavailable")):
+        with patch("tracker.sync.sync", side_effect=RuntimeError("Gmail unavailable")):
             with self.assertRaisesRegex(RuntimeError, "Gmail unavailable"):
                 run_sync(self.db)
         data = dashboard_data(self.db)
@@ -288,7 +309,7 @@ class RecordTests(unittest.TestCase):
             db.commit()
             raise RuntimeError("Gmail unavailable")
 
-        with patch("tracker.core.sync", side_effect=fail_after_database_loss):
+        with patch("tracker.sync.sync", side_effect=fail_after_database_loss):
             with self.assertRaisesRegex(RuntimeError, "Gmail unavailable"):
                 run_sync(self.db)
 
@@ -317,8 +338,65 @@ class RecordTests(unittest.TestCase):
                              (5000, "", 0))
             self.assertEqual(migrated.execute("SELECT order_id FROM refund_events").fetchone()[0], "OLD-ORDER")
             self.assertEqual(migrated.execute("SELECT count(*) FROM sync_runs").fetchone()[0], 0)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 1)
         finally:
             migrated.close()
+        backups = list(self.root.glob("legacy.before-schema-v0-to-v1-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+        with sqlite3.connect(backups[0]) as original:
+            self.assertEqual(original.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertEqual(original.execute("SELECT paid_cents FROM orders").fetchone()[0], 5000)
+            self.assertNotIn("merchant", {row[1] for row in original.execute("PRAGMA table_info(orders)")})
+        with connect(legacy_path) as reopened:
+            self.assertEqual(reopened.execute("PRAGMA user_version").fetchone()[0], 1)
+        self.assertEqual(list(self.root.glob("legacy.before-schema-v0-to-v1-*.sqlite3")), backups)
+
+    def test_newer_schema_is_rejected_without_changes(self):
+        path = self.root / "future.sqlite3"
+        with sqlite3.connect(path) as future:
+            future.execute("PRAGMA user_version=2")
+        with self.assertRaisesRegex(RuntimeError, "newer than this app supports"):
+            connect(path)
+        with sqlite3.connect(path) as future:
+            self.assertEqual(future.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(list(self.root.glob("future.before-schema-*.sqlite3")), [])
+
+    def test_failed_upgrade_keeps_pre_upgrade_backup(self):
+        path = self.root / "broken-upgrade.sqlite3"
+        with sqlite3.connect(path) as old:
+            old.execute("CREATE TABLE original (value TEXT)")
+            old.execute("INSERT INTO original VALUES ('kept')")
+
+        def fail(_db):
+            raise sqlite3.OperationalError("migration failed")
+
+        with patch("tracker.storage.MIGRATIONS", (fail,)):
+            with self.assertRaisesRegex(RuntimeError, "original ledger backup"):
+                connect(path)
+        backups = list(self.root.glob("broken-upgrade.before-schema-v0-to-v1-*.sqlite3"))
+        self.assertEqual(len(backups), 1)
+        with sqlite3.connect(backups[0]) as original:
+            self.assertEqual(original.execute("SELECT value FROM original").fetchone()[0], "kept")
+
+    def test_legacy_override_upgrade_uses_schema_version(self):
+        path = self.root / "old-overrides.sqlite3"
+        old = connect(path)
+        with old:
+            old.execute("""INSERT INTO orders
+                (order_id,ordered_ms,updated_ms,status,paid_cents,source_gmail_id,platform,manual_override)
+                VALUES ('LEGACY-ORDER',1000,1000,'paid',5000,'old-mail','Shopee',1)""")
+            old.execute("INSERT INTO ledger_meta VALUES ('legacy_overrides_migrated','1')")
+            old.execute("PRAGMA user_version=0")
+        old.close()
+        upgraded = connect(path)
+        try:
+            value = upgraded.execute("""SELECT value_json FROM order_overrides
+                WHERE order_id='LEGACY-ORDER' AND field='paid_cents'""").fetchone()
+            self.assertEqual(json.loads(value[0]), 5000)
+            self.assertEqual(upgraded.execute("PRAGMA user_version").fetchone()[0], 1)
+        finally:
+            upgraded.close()
 
     def test_review_items_can_be_marked_checked(self):
         order_id = add_manual_purchase(self.db, "Corner store", "2026-11-11", "100.00", "Rice", "Groceries")
@@ -347,7 +425,7 @@ class RecordTests(unittest.TestCase):
                 {"name": "Rice", "quantity": "1", "amount": "99.00", "category": "Groceries"}])
         refund_id = add_manual_refund(self.db, order_id, "2026-11-12", "30.00", {1: "30.00"})
         data = dashboard_data(self.db)
-        self.assertEqual(data["total_cents"], 12000)
+        self.assertEqual(select_dashboard(data).total, 12000)
         self.assertEqual(data["refunds"][0]["allocations"][0]["category"], "Home")
         self.assertIn("Home</span><strong>₱20.00", page(data))
         with self.assertRaisesRegex(ValueError, "add up"):
@@ -359,13 +437,13 @@ class RecordTests(unittest.TestCase):
         order_id = add_manual_purchase(self.db, "Market", "2026-11-11", "100.00", "Rice", "Groceries")
         record_refund_event(self.db, "first", "Other", "order", order_id, 2000, 1000, "mail-a", order_id)
         record_refund_event(self.db, "second", "Other", "order", order_id, 2000, 2000, "mail-b", order_id)
-        self.assertEqual(dashboard_data(self.db)["refund_total_cents"], 2000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).refund_total, 2000)
         self.assertEqual(len(dashboard_data(self.db)["pending_refunds"]), 1)
         resolve_refund_duplicate(self.db, "second", "distinct")
-        self.assertEqual(dashboard_data(self.db)["refund_total_cents"], 4000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).refund_total, 4000)
         decision_change = self.db.execute("SELECT id FROM changes ORDER BY id DESC LIMIT 1").fetchone()[0]
         undo_change(self.db, decision_change)
-        self.assertEqual(dashboard_data(self.db)["refund_total_cents"], 2000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).refund_total, 2000)
         resolve_refund_duplicate(self.db, "second", "distinct")
         self.db.close()
         self.db = connect(self.root / "expenses.sqlite3")
@@ -377,13 +455,13 @@ class RecordTests(unittest.TestCase):
                                           "shipping": "0", "protection": "0", "discount": "0", "coins": "0",
                                           "merchant": "Market", "category_0": "Groceries"})
         change = self.db.execute("SELECT id FROM changes ORDER BY id DESC LIMIT 1").fetchone()[0]
-        self.assertEqual(dashboard_data(self.db)["paid_total_cents"], 12000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).paid_total, 12000)
         undo_change(self.db, change)
-        self.assertEqual(dashboard_data(self.db)["paid_total_cents"], 10000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).paid_total, 10000)
         archive_record(self.db, "order", order_id)
-        self.assertEqual(dashboard_data(self.db)["paid_total_cents"], 0)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).paid_total, 0)
         archive_record(self.db, "order", order_id, restore=True)
-        self.assertEqual(dashboard_data(self.db)["paid_total_cents"], 10000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).paid_total, 10000)
 
     def test_account_binding_rejects_other_account_and_ambiguous_legacy(self):
         add_manual_purchase(self.db, "Market", "2026-11-11", "100.00", "Rice", "Groceries")
@@ -402,6 +480,33 @@ class RecordTests(unittest.TestCase):
             {"name": "Rice", "amount": ""}, {"name": "Soap", "amount": ""}]))
         self.assertEqual(self.db.execute("SELECT count(*) FROM refund_allocations").fetchone()[0], 0)
         self.assertEqual(self.db.execute("SELECT evidence_state FROM refund_events").fetchone()[0], "ambiguous")
+
+    def test_linked_refund_uses_purchase_category_after_correction(self):
+        order_id = add_manual_purchase(self.db, "Artist", "2026-11-11", "47.20", "Toy keychain", "Pet Supplies")
+        refund_id = add_manual_refund(self.db, order_id, "2026-11-12", "47.20")
+        data = dashboard_data(self.db)
+        self.assertEqual(data["refunds"][0]["allocations"][0]["category"], "Pet Supplies")
+        self.assertIn("Category: Pet Supplies", page(data))
+
+        correct_order(self.db, order_id, {"paid": "47.20", "status": "cancelled", "merchant": "Artist",
+                                          "category_0": "Hobbies"})
+        data = dashboard_data(self.db)
+        self.assertEqual(data["refunds"][0]["allocations"][0]["category"], "Hobbies")
+        self.assertEqual(select_dashboard(data).net_categories.get("Pet Supplies"), None)
+        self.assertEqual(select_dashboard(data).net_categories["Hobbies"], 0)
+        self.assertIn("Category: Hobbies", page(data))
+        self.assertNotIn("Unallocated refunds", page(data))
+
+    def test_item_refund_uses_corrected_item_category(self):
+        order_id = add_manual_purchase(self.db, "Market", "2026-11-11", "150.00", items=[
+            {"name": "Rice", "quantity": "1", "amount": "100.00", "category": "Groceries"},
+            {"name": "Keychain", "quantity": "1", "amount": "50.00", "category": "Pet Supplies"}])
+        add_manual_refund(self.db, order_id, "2026-11-12", "20.00", {1: "20.00"})
+        correct_order(self.db, order_id, {"paid": "150.00", "status": "paid", "merchant": "Market",
+                                          "category_1": "Hobbies"})
+        allocation = dashboard_data(self.db)["refunds"][0]["allocations"][0]
+        self.assertEqual((allocation["item_position"], allocation["category"], allocation["amount_cents"]),
+                         (1, "Hobbies", 2000))
 
     def test_same_category_combined_refund_allocates_category_only(self):
         order_id = add_manual_purchase(self.db, "Market", "2026-11-11", "100.00", items=[
@@ -440,14 +545,14 @@ class RecordTests(unittest.TestCase):
         response = {"orders": [{"order_id": order_id, "refund_items": [{"name": "Rice", "amount": "20.00"}]}]}
         message = {"payload": {"headers": [{"name": "Subject", "value": "Refund"}]}}
         with patch.dict("os.environ", {"GMAIL_ACCOUNT": "first@example.com"}), \
-             patch("tracker.core.gmail_service"), \
-             patch("tracker.core.gmail_execute", return_value=message), \
-             patch("tracker.core.mime_text", return_value="Rice refunded\nCustomer email first@example.com") as mime, \
-             patch("tracker.core.gemini_extract", return_value=response) as gemini:
+             patch("tracker.sync.gmail_service"), \
+             patch("tracker.sync.gmail_execute", return_value=message), \
+             patch("tracker.sync.mime_text", return_value="Rice refunded\nCustomer email first@example.com") as mime, \
+             patch("tracker.sync.gemini_extract", return_value=response) as gemini:
             self.assertEqual(recheck_refunds(self.db), (1, 0))
         self.assertIn("[email redacted]", gemini.call_args.args[0])
         self.assertNotIn("first@example.com", gemini.call_args.args[0])
-        self.assertEqual(dashboard_data(self.db)["refund_total_cents"], 2000)
+        self.assertEqual(select_dashboard(dashboard_data(self.db)).refund_total, 2000)
         self.assertEqual(self.db.execute("SELECT amount_cents FROM refund_allocations").fetchone()[0], 2000)
 
 
