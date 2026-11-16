@@ -8,8 +8,8 @@ import math
 from .core import php
 
 
-PALETTE = ("#3f8069", "#e59462", "#7976b0", "#d6b451", "#5d9bbb",
-           "#bd7792", "#78a25a", "#aa8367", "#638d90", "#a4a8aa")
+PALETTE = ("#343a40", "#737a80", "#9a9088", "#5d6971", "#afa8a0",
+           "#626a69", "#91868a", "#a4a9aa", "#786f69", "#b8bbbe")
 
 
 def line_chart(series: list[tuple[str, int]], granularity: str) -> str:

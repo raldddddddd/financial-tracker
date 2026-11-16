@@ -34,6 +34,74 @@ for (const tab of trendTabs) {
   });
 }
 
+const orders = document.querySelector('#orders');
+const searchForm = orders?.querySelector('.order-search');
+let orderRequest;
+
+async function showOrders(url, addHistory = true) {
+  orderRequest?.abort();
+  const request = new AbortController();
+  orderRequest = request;
+  orders.setAttribute('aria-busy', 'true');
+  try {
+    // shortcut: fetches the full dashboard; add an orders-only response if searches become slow.
+    const response = await fetch(url, { signal: request.signal });
+    if (!response.ok) throw new Error('Could not load orders');
+    const nextPage = new DOMParser().parseFromString(await response.text(), 'text/html');
+    if (request !== orderRequest) return;
+    const next = nextPage.querySelector('#orders');
+    if (!next) throw new Error('Orders missing from response');
+
+    const heading = orders.querySelector('.section-heading');
+    heading.querySelector('.section-meta').textContent = next.querySelector('.section-meta').textContent;
+    if (heading.querySelector('.insight-note')) {
+      heading.querySelector('.insight-note').textContent = next.querySelector('.insight-note').textContent;
+    }
+    orders.querySelector('tbody').replaceWith(next.querySelector('tbody'));
+    orders.querySelector('.pagination')?.remove();
+    if (next.querySelector('.pagination')) orders.append(next.querySelector('.pagination'));
+    searchForm.querySelector('a')?.remove();
+    if (next.querySelector('.order-search a')) searchForm.append(next.querySelector('.order-search a'));
+    searchForm.querySelector('input[name="q"]').value = next.querySelector('input[name="q"]').value;
+
+    for (const selector of ['.shop-filter a', '.period-filter a', '.category-card a', '.trend-tabs a', '.orders-card > .category-reset']) {
+      const links = document.querySelectorAll(selector);
+      const newLinks = nextPage.querySelectorAll(selector);
+      links.forEach((link, index) => link.setAttribute('href', newLinks[index].getAttribute('href')));
+    }
+    for (const form of document.querySelectorAll('.period-filter form')) {
+      form.querySelector('input[name="q"]')?.remove();
+      const value = nextPage.querySelector(`.period-filter .${form.className} input[name="q"]`);
+      if (value) form.append(value);
+    }
+    if (addHistory) history.pushState(null, '', url);
+    if (addHistory) searchForm.querySelector('input[name="q"]').focus({ preventScroll: true });
+  } catch (error) {
+    if (error.name !== 'AbortError') location.assign(url);
+  } finally {
+    if (request === orderRequest) orders.removeAttribute('aria-busy');
+  }
+}
+
+searchForm?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const url = new URL(searchForm.action);
+  url.search = new URLSearchParams(new FormData(searchForm));
+  if (!url.searchParams.get('q')) url.searchParams.delete('q');
+  showOrders(url);
+});
+
+orders?.addEventListener('click', (event) => {
+  const link = event.target.closest('.order-search a');
+  if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  showOrders(link.href);
+});
+
+window.addEventListener('popstate', () => {
+  if (orders) showOrders(location.href, false);
+});
+
 document.querySelector('[data-add-item]')?.addEventListener('click', () => {
   const basket = document.querySelector('[data-basket-items]');
   const template = basket?.querySelector('[data-basket-item]:last-child');
@@ -55,15 +123,21 @@ for (const input of document.querySelectorAll('[data-refund-order]')) {
   if (!container) continue;
   const existing = JSON.parse(container.dataset.existing || '{}');
   const initialOrder = input.value;
+  let requestId = 0;
   const loadItems = async () => {
+    const currentRequest = ++requestId;
+    const order = input.value.trim();
     container.replaceChildren();
-    if (!input.value.trim()) return;
+    if (!order) return;
+    container.textContent = 'Loading order items…';
     try {
-      const response = await fetch(`/order-items?order=${encodeURIComponent(input.value.trim())}`);
+      const response = await fetch(`/order-items?order=${encodeURIComponent(order)}`);
       if (!response.ok) throw new Error('Could not load order items');
       const items = await response.json();
+      if (currentRequest !== requestId) return;
+      container.replaceChildren();
       if (!items.length) {
-        container.textContent = 'No items found for this order; refund stays unallocated.';
+        container.textContent = 'No items found for this order; its category is unallocated.';
         return;
       }
       const heading = document.createElement('strong');
@@ -78,22 +152,23 @@ for (const input of document.querySelectorAll('[data-refund-order]')) {
         amount.min = '0';
         amount.step = '0.01';
         amount.placeholder = '₱ amount returned';
-        amount.value = input.value === initialOrder ? (existing[item.position] || '') : '';
+        amount.value = order === initialOrder ? (existing[item.position] || '') : '';
         label.append(amount);
         container.append(label);
       }
       const note = document.createElement('small');
-      note.textContent = 'Enter item amounts totaling the refund to assign categories. Leave blank to keep it unallocated.';
+      note.textContent = 'Enter item amounts totaling the refund for mixed-category orders. Single-category refunds follow the purchase category.';
       container.append(note);
     } catch {
-      container.textContent = 'Could not load order items. You can still save the refund unallocated.';
+      if (currentRequest === requestId) container.textContent = 'Could not load order items. You can still save the refund.';
     }
   };
   let timer;
   input.addEventListener('input', () => {
+    ++requestId;
+    container.replaceChildren();
     clearTimeout(timer);
     timer = setTimeout(loadItems, 200);
   });
-  input.addEventListener('change', loadItems);
   if (input.value) loadItems();
 }
